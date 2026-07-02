@@ -101,6 +101,20 @@ router.post('/:id/sizes', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
+router.delete('/:id/sizes/:label', async (req, res) => {
+  const productId = Number(req.params.id);
+  const label     = req.params.label;
+  try {
+    await db.delete(sizeLibrary).where(
+      and(eq(sizeLibrary.productId, productId), eq(sizeLibrary.sizeLabel, label))
+    );
+    await db.delete(productSizes).where(
+      and(eq(productSizes.productId, productId), eq(productSizes.sizeLabel, label))
+    );
+    res.sendStatus(204);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
 // ── Library (scoped to product) ───────────────────────────────────────────────
 
 router.get('/:id/library', async (req, res) => {
