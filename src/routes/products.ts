@@ -156,6 +156,28 @@ router.post('/:id/library', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
+router.get('/:id/size-shapes', async (req, res) => {
+  const size = req.query.size as string | undefined;
+  if (!size) { res.status(400).json({ error: 'size query param required' }); return; }
+  try {
+    const rows = await db
+      .select({
+        id:         sizeLibrary.id,
+        sizeLabel:  sizeLibrary.sizeLabel,
+        partName:   sizeLibrary.partName,
+        svgContent: sizeLibrary.svgContent,
+        capturedAt: sizeLibrary.capturedAt,
+      })
+      .from(sizeLibrary)
+      .where(and(
+        eq(sizeLibrary.productId, Number(req.params.id)),
+        eq(sizeLibrary.sizeLabel, size)
+      ))
+      .orderBy(asc(sizeLibrary.partName));
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
 router.get('/:id/captured-sizes', async (req, res) => {
   const part = req.query.part as string | undefined;
   if (!part) { res.status(400).json({ error: 'part query param required' }); return; }
