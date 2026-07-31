@@ -29,7 +29,7 @@ interface ProviderConfig {
 
 const PROVIDERS: Record<string, ProviderConfig> = {
   openai:    { endpoint: 'https://api.openai.com/v1/chat/completions',      defaultModel: 'gpt-4o',                format: 'openai',    supportsVision: true  },
-  gemini:    { endpoint: '',                                                  defaultModel: 'gemini-1.5-pro',         format: 'gemini',    supportsVision: true  },
+  gemini:    { endpoint: '',                                                  defaultModel: 'gemini-2.5-flash',       format: 'gemini',    supportsVision: true  },
   anthropic: { endpoint: 'https://api.anthropic.com/v1/messages',           defaultModel: 'claude-opus-4-8',        format: 'anthropic', supportsVision: true  },
   deepseek:  { endpoint: 'https://api.deepseek.com/chat/completions',       defaultModel: 'deepseek-chat',          format: 'openai',    supportsVision: false },
   kimi:      { endpoint: 'https://api.moonshot.cn/v1/chat/completions',     defaultModel: 'moonshot-v1-8k-vision',  format: 'openai',    supportsVision: true  },
