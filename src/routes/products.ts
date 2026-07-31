@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { asc, eq, and, sql } from 'drizzle-orm';
+import { asc, eq, and, sql, ne } from 'drizzle-orm';
 import { db } from '../db';
 import { products, productParts, productSizes, sizeLibrary } from '../db/schema';
 
@@ -41,11 +41,11 @@ router.delete('/:id', async (req, res) => {
 router.get('/:id/parts', async (req, res) => {
   try {
     const rows = await db
-      .select({ partName: productParts.partName })
+      .select({ partName: productParts.partName, isBase: productParts.isBase })
       .from(productParts)
       .where(eq(productParts.productId, Number(req.params.id)))
       .orderBy(asc(productParts.sortOrder), asc(productParts.partName));
-    res.json(rows.map(r => r.partName));
+    res.json(rows.map(r => ({ name: r.partName, isBase: r.isBase })));
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -72,6 +72,39 @@ router.delete('/:id/parts/:name', async (req, res) => {
     await db.delete(productParts).where(
       and(eq(productParts.productId, productId), eq(productParts.partName, partName))
     );
+    res.sendStatus(204);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+// PATCH /products/:id/parts/:name/base — set or unset the base flag
+// Only one part per product may be base; setting a second one returns 409.
+router.patch('/:id/parts/:name/base', async (req, res) => {
+  const productId = Number(req.params.id);
+  const partName  = req.params.name;
+  const { isBase } = req.body as { isBase?: boolean };
+  if (typeof isBase !== 'boolean') { res.status(400).json({ error: 'isBase (boolean) required' }); return; }
+
+  try {
+    if (isBase) {
+      const existing = await db
+        .select({ partName: productParts.partName })
+        .from(productParts)
+        .where(and(
+          eq(productParts.productId, productId),
+          eq(productParts.isBase, true),
+          ne(productParts.partName, partName),
+        ));
+      if (existing.length > 0) {
+        res.status(409).json({
+          error: `"${existing[0].partName}" is already the base part for this product. Unset it first.`,
+        });
+        return;
+      }
+    }
+    await db
+      .update(productParts)
+      .set({ isBase })
+      .where(and(eq(productParts.productId, productId), eq(productParts.partName, partName)));
     res.sendStatus(204);
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });

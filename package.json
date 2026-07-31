@@ -10,9 +10,11 @@
     "db:migrate": "drizzle-kit migrate"
   },
   "dependencies": {
+    "@types/pdf-parse": "^1.1.5",
     "dotenv": "^16.4.5",
     "drizzle-orm": "^0.38.4",
     "express": "^4.21.2",
+    "pdf-parse": "^2.4.5",
     "pg": "^8.13.1"
   },
   "devDependencies": {

@@ -8,6 +8,20 @@
       "when": 1781184531191,
       "tag": "0000_plain_shooting_star",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1785500350467,
+      "tag": "0001_smooth_elektra",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785503589277,
+      "tag": "0002_handy_legion",
+      "breakpoints": true
     }
   ]
 }

@@ -1,0 +1,1 @@
+ALTER TABLE "product_parts" ADD COLUMN "is_base" boolean DEFAULT false NOT NULL;
