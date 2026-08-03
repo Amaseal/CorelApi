@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { asc, eq, and, sql, ne } from 'drizzle-orm';
+import { asc, eq, and, sql, ne, inArray } from 'drizzle-orm';
 import { db } from '../db';
 import { products, productParts, productSizes, sizeLibrary } from '../db/schema';
 
@@ -229,6 +229,32 @@ router.get('/:id/size-shapes', async (req, res) => {
         eq(sizeLibrary.sizeLabel, size)
       ))
       .orderBy(asc(sizeLibrary.partName));
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+// GET /products/:id/library/shapes?sizes=S,M,XL
+// Returns full library entries (with svgContent) for specific sizes only.
+// Used by the plugin at generation time to avoid fetching unused sizes.
+router.get('/:id/library/shapes', async (req, res) => {
+  const sizesParam = (req.query.sizes as string | undefined) ?? '';
+  const sizes = sizesParam.split(',').map(s => s.trim()).filter(Boolean);
+  if (sizes.length === 0) { res.status(400).json({ error: 'sizes query param required (comma-separated)' }); return; }
+  try {
+    const rows = await db
+      .select({
+        id:         sizeLibrary.id,
+        sizeLabel:  sizeLibrary.sizeLabel,
+        partName:   sizeLibrary.partName,
+        svgContent: sizeLibrary.svgContent,
+        capturedAt: sizeLibrary.capturedAt,
+      })
+      .from(sizeLibrary)
+      .where(and(
+        eq(sizeLibrary.productId, Number(req.params.id)),
+        inArray(sizeLibrary.sizeLabel, sizes),
+      ))
+      .orderBy(asc(sizeLibrary.partName), asc(sizeLibrary.sizeLabel));
     res.json(rows);
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
