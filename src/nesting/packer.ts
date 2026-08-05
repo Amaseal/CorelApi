@@ -11,27 +11,31 @@ function rotationsFor(mode: RotationMode): number[] {
   return angles;
 }
 
-// Candidate bottom-left anchor points: sheet origin plus every corner of every already-placed
-// part's bounding box. This is a cheap stand-in for a full no-fit-polygon touching-point search —
-// it keeps parts packed tight against sheet edges and each other without computing Minkowski sums.
+// Candidate bottom-left anchor points: sheet origin plus every VERTEX of every already-placed
+// part's actual outline. This is a cheap stand-in for a full no-fit-polygon touching-point
+// search: using real polygon vertices — not just bounding-box corners — lets the candidate's
+// corner land snug against a concave notch, an angled edge, or any other contour feature a
+// coarse bbox-corner grid is blind to, without computing Minkowski sums. It's still an
+// approximation (only the candidate's own bbox-min corner is tried against these points, not
+// every vertex pairing), but it's a meaningfully closer approximation to a real touching-point
+// search than bounding boxes alone.
 function candidateAnchors(sheet: SheetSize, placed: Polygon[]): Point[] {
-  const xs = new Set<number>([0]);
-  const ys = new Set<number>([0]);
-  for (const p of placed) {
-    const bb = boundingBox(p);
-    xs.add(bb.minX);
-    xs.add(bb.maxX);
-    ys.add(bb.minY);
-    ys.add(bb.maxY);
-  }
+  const seen = new Set<string>();
   const anchors: Point[] = [];
-  for (const y of ys) {
-    for (const x of xs) {
-      if (x >= -EPS && y >= -EPS && x <= sheet.width + EPS && y <= sheet.height + EPS) {
-        anchors.push([x, y]);
-      }
-    }
+
+  const tryAdd = (x: number, y: number) => {
+    if (x < -EPS || y < -EPS || x > sheet.width + EPS || y > sheet.height + EPS) return;
+    const key = Math.round(x * 1000) + ',' + Math.round(y * 1000);
+    if (seen.has(key)) return;
+    seen.add(key);
+    anchors.push([x, y]);
+  };
+
+  tryAdd(0, 0);
+  for (const poly of placed) {
+    for (const [x, y] of poly) tryAdd(x, y);
   }
+
   anchors.sort((p1, p2) => p1[1] - p2[1] || p1[0] - p2[0]);
   return anchors;
 }

@@ -2,6 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Polygon, polygonMinDistance } from './geometry';
 import { runNesting } from './nest';
+import { packAttempt } from './packer';
+import { PartInstance } from './types';
 
 const rect = (w: number, h: number): Polygon => [[0, 0], [w, 0], [w, h], [0, h]];
 
@@ -56,6 +58,23 @@ describe('runNesting', () => {
     // Against the tight 10x10 footprint this should be ~100%; against the nominal 500x500 sheet
     // it would be ~0.04% — a result in the high range proves it's scored against the footprint.
     assert.ok(result.utilizationPct > 90, `expected utilization scored against the footprint, got ${result.utilizationPct}%`);
+  });
+
+  it('finds placements inside concave notches using real polygon vertices, not just bbox corners', async () => {
+    // An L-shape has a 10x10 bounding box with its top-right quadrant (5,5)-(10,10) empty.
+    // A 4x4 square only fits there if the candidate anchor set includes the notch's own inner
+    // corner (5,5) — a bbox-corner-only candidate set (the sheet corners here, since the L's
+    // bbox exactly equals the sheet) offers no valid position for it at all, forcing a second
+    // sheet. This is the concrete case the vertex-based candidateAnchors rewrite targets.
+    const L: Polygon = [[0, 0], [10, 0], [10, 5], [5, 5], [5, 10], [0, 10]];
+    const square: Polygon = [[0, 0], [4, 0], [4, 4], [0, 4]];
+    const instances: PartInstance[] = [
+      { instanceId: 'L#0', partId: 'L', outline: L, holes: [], rotationMode: 'locked' },
+      { instanceId: 'sq#0', partId: 'sq', outline: square, holes: [], rotationMode: 'locked' },
+    ];
+
+    const result = await packAttempt({ width: 10, height: 10 }, 0, instances);
+    assert.equal(result.sheetsUsed, 1, "the square should nestle into the L-shape's notch instead of needing a second sheet");
   });
 
   it('reports progress and honors cancellation', async () => {
