@@ -160,6 +160,18 @@ function segmentDistance(a1: Point, a2: Point, b1: Point, b2: Point): number {
   );
 }
 
+// Minimum possible distance between two polygons' bounding boxes (0 if the boxes touch or
+// overlap). Always <= the true polygon-to-polygon distance, since each polygon sits inside its
+// own box — so it's a safe, cheap lower bound: if this already clears a required gap, the exact
+// (expensive) distance check can be skipped entirely.
+export function boundingBoxDistance(a: Polygon, b: Polygon): number {
+  const bbA = boundingBox(a);
+  const bbB = boundingBox(b);
+  const dx = Math.max(0, bbA.minX - bbB.maxX, bbB.minX - bbA.maxX);
+  const dy = Math.max(0, bbA.minY - bbB.maxY, bbB.minY - bbA.maxY);
+  return Math.hypot(dx, dy);
+}
+
 // Minimum distance between two polygons' boundaries. Returns 0 if they touch or overlap.
 export function polygonMinDistance(a: Polygon, b: Polygon): number {
   if (polygonsOverlap(a, b)) return 0;

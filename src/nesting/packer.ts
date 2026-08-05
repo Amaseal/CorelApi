@@ -1,4 +1,4 @@
-import { EPS, Point, Polygon, boundingBox, netArea, placeAtAnchor, polygonMinDistance, polygonsOverlap, rotateAroundCentroid } from './geometry';
+import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonMinDistance, polygonsOverlap, rotateAroundCentroid } from './geometry';
 import { NestingError, PackResult, PartInstance, Placement, RotationMode, SheetSize } from './types';
 
 const FREE_ROTATION_STEP_DEG = 15;
@@ -42,6 +42,11 @@ function fitsOnSheet(poly: Polygon, sheet: SheetSize, placed: Polygon[], gap: nu
     return false;
   }
   for (const p of placed) {
+    // Cheap lower-bound check first: most candidate positions across a sheet are nowhere near
+    // most already-placed parts, and this skips the O(edges_a * edges_b) exact checks for all
+    // of them — without it, this was the main cost behind real jobs blocking the event loop for
+    // tens of seconds at a time.
+    if (boundingBoxDistance(poly, p) > gap + EPS) continue;
     if (polygonsOverlap(poly, p)) return false;
     if (gap > EPS && polygonMinDistance(poly, p) < gap - EPS) return false;
   }
@@ -81,13 +86,17 @@ function tryPlacePart(part: PartInstance, sheet: SheetSize, placed: Polygon[], g
 // Node is single-threaded, and this loop is the only CPU-heavy part of the whole API — with many
 // parts (candidate anchors grow with placed count) and free rotation (24 angles tried per part),
 // a single attempt can take long enough to block the event loop for that whole stretch, freezing
-// every other request the server is handling (including unrelated /health checks). Yielding every
-// few parts keeps the server responsive without meaningfully slowing down the nest itself.
-const YIELD_EVERY_N_PARTS = 5;
+// every other request the server is handling (including unrelated /health checks) for the same
+// stretch — long enough, in practice, to blow past the plugin's own HTTP timeout on a poll that's
+// unlucky enough to land during it. Per-part cost isn't uniform (it grows as more parts get
+// placed), so yielding is time-based rather than every-N-parts — it checks in regardless of how
+// expensive the parts around it turn out to be.
+const YIELD_INTERVAL_MS = 100;
 
 export async function packAttempt(sheet: SheetSize, gap: number, instances: PartInstance[]): Promise<PackResult> {
   const sheetsPlaced: Polygon[][] = [[]];
   const placements: Placement[] = [];
+  let lastYieldAt = Date.now();
 
   for (let idx = 0; idx < instances.length; idx++) {
     const part = instances[idx];
@@ -120,7 +129,8 @@ export async function packAttempt(sheet: SheetSize, gap: number, instances: Part
       outline: placement.outline,
     });
 
-    if (idx % YIELD_EVERY_N_PARTS === YIELD_EVERY_N_PARTS - 1) {
+    if (Date.now() - lastYieldAt >= YIELD_INTERVAL_MS) {
+      lastYieldAt = Date.now();
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
   }
