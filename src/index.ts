@@ -7,6 +7,7 @@ import productsRouter from './routes/products';
 import libraryRouter  from './routes/library';
 import settingsRouter from './routes/settings';
 import ordersRouter   from './routes/orders';
+import nestingRouter  from './routes/nesting';
 
 const app = express();
 
@@ -17,6 +18,7 @@ app.use('/products', productsRouter);
 app.use('/library',  libraryRouter);
 app.use('/settings', settingsRouter);
 app.use('/orders',   ordersRouter);
+app.use('/nesting',  nestingRouter);
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
