@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { Point, Polygon } from '../nesting/geometry';
+import { Point, Polygon, simplifyToPointBudget } from '../nesting/geometry';
 import { cancelJob, createJob, getJob, NestJobConfig } from '../nesting/jobs';
 import { NestPart } from '../nesting/nest';
 import { RotationMode } from '../nesting/types';
@@ -7,6 +7,12 @@ import { RotationMode } from '../nesting/types';
 const router = Router();
 
 const ROTATION_MODES: RotationMode[] = ['free', 'locked', 'step90'];
+
+// Safety net independent of whatever simplification the client already applied: polygon
+// complexity feeds an O(edges^2) cost into every overlap/distance check the packer does, plus
+// the candidate anchor count, so one unexpectedly detailed outline can blow up nesting time
+// regardless of part count. Every outline/hole is capped here before it ever reaches the packer.
+const MAX_OUTLINE_POINTS = 40;
 
 function parsePolygon(raw: unknown, label: string): Polygon {
   if (!Array.isArray(raw) || raw.length < 3) throw new Error(`${label} must be an array of at least 3 [x,y] points`);
@@ -25,9 +31,9 @@ function parsePart(raw: any, i: number): NestPart {
   if (!ROTATION_MODES.includes(raw.rotationMode)) {
     throw new Error(`parts[${i}].rotationMode must be one of ${ROTATION_MODES.join(', ')}`);
   }
-  const outline = parsePolygon(raw.outline, `parts[${i}].outline`);
+  const outline = simplifyToPointBudget(parsePolygon(raw.outline, `parts[${i}].outline`), MAX_OUTLINE_POINTS, 0.1);
   const holes = Array.isArray(raw.holes)
-    ? raw.holes.map((h: unknown, hi: number) => parsePolygon(h, `parts[${i}].holes[${hi}]`))
+    ? raw.holes.map((h: unknown, hi: number) => simplifyToPointBudget(parsePolygon(h, `parts[${i}].holes[${hi}]`), MAX_OUTLINE_POINTS, 0.1))
     : [];
   return { partId: raw.id, quantity, outline, holes, rotationMode: raw.rotationMode };
 }

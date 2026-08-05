@@ -187,3 +187,81 @@ export function polygonMinDistance(a: Polygon, b: Polygon): number {
   }
   return min;
 }
+
+// Douglas-Peucker simplification of a CLOSED polygon, splitting it into two open chains at
+// opposite ends so the algorithm never degenerates on a "line" whose start and end coincide.
+function simplifyClosedPolygon(pts: Polygon, tolerance: number): Polygon {
+  const n = pts.length;
+  if (n <= 4 || tolerance <= 0) return pts;
+
+  const split = Math.floor(n / 2);
+  const chain1 = pts.slice(0, split + 1);
+  const chain2 = pts.slice(split).concat([pts[0]]);
+
+  const r1 = rdpSimplify(chain1, tolerance);
+  const r2 = rdpSimplify(chain2, tolerance);
+
+  const result = r1.concat(r2.slice(1, -1));
+  return result.length >= 3 ? result : pts;
+}
+
+function rdpSimplify(pts: Polygon, tolerance: number): Polygon {
+  if (pts.length < 3) return pts;
+
+  let maxDist = 0;
+  let index = 0;
+  const a = pts[0], b = pts[pts.length - 1];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const d = perpendicularDistance(pts[i], a, b);
+    if (d > maxDist) { maxDist = d; index = i; }
+  }
+
+  if (maxDist > tolerance) {
+    const left = rdpSimplify(pts.slice(0, index + 1), tolerance);
+    const right = rdpSimplify(pts.slice(index), tolerance);
+    return left.slice(0, -1).concat(right);
+  }
+  return [a, b];
+}
+
+function perpendicularDistance(p: Point, a: Point, b: Point): number {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq < EPS) return Math.hypot(p[0] - a[0], p[1] - a[1]);
+  const t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / lenSq;
+  const cx = a[0] + t * dx, cy = a[1] + t * dy;
+  return Math.hypot(p[0] - cx, p[1] - cy);
+}
+
+// Simplifies a polygon down to at most `maxPoints`, doubling the tolerance until it fits. This is
+// a server-side safety net independent of whatever simplification the client already applied —
+// polygon complexity feeds an O(edges^2) cost in every overlap/distance check plus the candidate
+// anchor count, so an unexpectedly detailed outline (or a client that sent one unsimplified) can
+// blow up nesting time regardless of part count.
+export function simplifyToPointBudget(pts: Polygon, maxPoints: number, startTolerance: number): Polygon {
+  if (pts.length <= maxPoints) return pts;
+  let tolerance = startTolerance > 0 ? startTolerance : 0.1;
+  let result = simplifyClosedPolygon(pts, tolerance);
+  for (let attempt = 0; attempt < 10 && result.length > maxPoints; attempt++) {
+    tolerance *= 2;
+    result = simplifyClosedPolygon(pts, tolerance);
+  }
+  return result;
+}
+
+// True if a and b overlap or come within `gap` of each other. Unlike polygonMinDistance, this
+// stops at the first violating segment pair instead of always scanning every pair to find the
+// exact minimum — the gap check only ever needs a yes/no answer, and with a nonzero gap most
+// "too close" candidates violate it well before the last edge pair, which is the difference
+// between an O(edges^2) scan that always runs to completion and one that usually exits early.
+export function polygonsWithinDistance(a: Polygon, b: Polygon, gap: number): boolean {
+  if (polygonsOverlap(a, b)) return true;
+  for (let i = 0; i < a.length; i++) {
+    const a1 = a[i], a2 = a[(i + 1) % a.length];
+    for (let j = 0; j < b.length; j++) {
+      const b1 = b[j], b2 = b[(j + 1) % b.length];
+      if (segmentDistance(a1, a2, b1, b2) < gap - EPS) return true;
+    }
+  }
+  return false;
+}
