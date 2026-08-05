@@ -77,11 +77,20 @@ function tryPlacePart(part: PartInstance, sheet: SheetSize, placed: Polygon[], g
 // Packs every instance (in the given order) onto one or more sheets using greedy bottom-left-fill.
 // A part that doesn't fit on any sheet placed so far opens a new sheet; earlier sheets are tried
 // first so gaps left by earlier, larger parts can still be filled by later, smaller ones.
-export function packAttempt(sheet: SheetSize, gap: number, instances: PartInstance[]): PackResult {
+//
+// Node is single-threaded, and this loop is the only CPU-heavy part of the whole API — with many
+// parts (candidate anchors grow with placed count) and free rotation (24 angles tried per part),
+// a single attempt can take long enough to block the event loop for that whole stretch, freezing
+// every other request the server is handling (including unrelated /health checks). Yielding every
+// few parts keeps the server responsive without meaningfully slowing down the nest itself.
+const YIELD_EVERY_N_PARTS = 5;
+
+export async function packAttempt(sheet: SheetSize, gap: number, instances: PartInstance[]): Promise<PackResult> {
   const sheetsPlaced: Polygon[][] = [[]];
   const placements: Placement[] = [];
 
-  for (const part of instances) {
+  for (let idx = 0; idx < instances.length; idx++) {
+    const part = instances[idx];
     let sheetIndex = -1;
     let placement: PlacementCandidate | null = null;
 
@@ -110,6 +119,10 @@ export function packAttempt(sheet: SheetSize, gap: number, instances: PartInstan
       rotationDeg: placement.rotationDeg,
       outline: placement.outline,
     });
+
+    if (idx % YIELD_EVERY_N_PARTS === YIELD_EVERY_N_PARTS - 1) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
   }
 
   const sheetArea = sheet.width * sheet.height;

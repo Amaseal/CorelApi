@@ -26,6 +26,10 @@ interface Job {
 const jobs = new Map<string, Job>();
 const JOB_TTL_MS = 30 * 60 * 1000;
 
+// Progress fires every few placed parts (see packer.ts's yield points) — that can be very
+// frequent for a large job, so progress lines are throttled to avoid flooding the logs.
+const PROGRESS_LOG_INTERVAL_MS = 2000;
+
 export function createJob(config: NestJobConfig): string {
   const id = randomUUID();
   const job: Job = {
@@ -41,7 +45,17 @@ export function createJob(config: NestJobConfig): string {
   };
   jobs.set(id, job);
 
+  const partCount = config.parts.reduce((sum, p) => sum + p.quantity, 0);
+  const pointCount = config.parts.reduce((sum, p) => sum + p.outline.length * p.quantity, 0);
+  console.log(
+    `[nest ${id}] start: ${partCount} part(s), ~${pointCount} outline point(s), ` +
+    `sheet ${config.sheet.width}x${config.sheet.height}mm, gap ${config.gap}mm, ` +
+    `budget ${config.budget.timeBudgetSec ? config.budget.timeBudgetSec + 's' : config.budget.maxIterations + ' iterations'}`
+  );
+
   const startedAt = Date.now();
+  let lastProgressLogAt = 0;
+
   runNesting(
     config.sheet,
     config.gap,
@@ -51,16 +65,28 @@ export function createJob(config: NestJobConfig): string {
       job.iterationsTried = iterationsTried;
       job.best = best;
       job.elapsedMs = Date.now() - startedAt;
+
+      const now = Date.now();
+      if (now - lastProgressLogAt >= PROGRESS_LOG_INTERVAL_MS) {
+        lastProgressLogAt = now;
+        const bestInfo = best ? `best so far: ${best.sheetsUsed} sheet(s), ${best.utilizationPct.toFixed(1)}% used` : 'no valid arrangement yet';
+        console.log(`[nest ${id}] progress: ${iterationsTried} attempt(s), ${(job.elapsedMs / 1000).toFixed(1)}s elapsed, ${bestInfo}`);
+      }
     },
     () => job.cancelled,
   )
     .then((result) => {
       job.best = result;
       job.status = 'done';
+      console.log(
+        `[nest ${id}] done: ${result.sheetsUsed} sheet(s), ${result.utilizationPct.toFixed(1)}% utilization, ` +
+        `${job.iterationsTried} attempt(s), ${(job.elapsedMs / 1000).toFixed(1)}s`
+      );
     })
     .catch((e) => {
       job.status = 'error';
       job.error = e instanceof NestingError ? e.message : String(e);
+      console.error(`[nest ${id}] failed after ${job.iterationsTried} attempt(s):`, e);
     })
     .finally(() => {
       job.finishedAt = Date.now();
@@ -77,6 +103,7 @@ export function getJob(id: string) {
 export function cancelJob(id: string): boolean {
   const job = jobs.get(id);
   if (!job) return false;
+  console.log(`[nest ${id}] cancel requested at ${job.iterationsTried} attempt(s)`);
   job.cancelled = true;
   return true;
 }

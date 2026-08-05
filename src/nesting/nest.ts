@@ -69,7 +69,7 @@ export async function runNesting(
 
   while (iterations < maxIterations && Date.now() - start < timeBudgetMs && !isCancelled()) {
     try {
-      const result = packAttempt(sheet, gap, order);
+      const result = await packAttempt(sheet, gap, order);
       if (!best || isBetter(result, best)) best = result;
     } catch (e) {
       if (!(e instanceof NestingError)) throw e;
