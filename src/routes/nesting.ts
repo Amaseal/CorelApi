@@ -8,11 +8,14 @@ const router = Router();
 
 const ROTATION_MODES: RotationMode[] = ['free', 'locked', 'step90'];
 
-// Safety net independent of whatever simplification the client already applied: polygon
-// complexity feeds an O(edges^2) cost into every overlap/distance check the packer does, plus
-// the candidate anchor count, so one unexpectedly detailed outline can blow up nesting time
-// regardless of part count. Every outline/hole is capped here before it ever reaches the packer.
-const MAX_OUTLINE_POINTS = 40;
+// A true safety net for pathological inputs (an unexpectedly detailed outline, or a client that
+// sent one unsimplified) — NOT a routine transformation. The plugin already lets the operator
+// control the fidelity/speed tradeoff directly via its own "Outline detail" tolerance (typically
+// landing around 40-60 points/part); silently re-simplifying everything down to a much lower
+// target here overrides that choice and can visibly distort the contour features (notches,
+// curves) that let parts actually nest tightly — this was tried at 40 and made real jobs pack
+// noticeably worse. Set high enough that it essentially never fires on a normally-simplified part.
+const MAX_OUTLINE_POINTS = 200;
 
 function parsePolygon(raw: unknown, label: string): Polygon {
   if (!Array.isArray(raw) || raw.length < 3) throw new Error(`${label} must be an array of at least 3 [x,y] points`);

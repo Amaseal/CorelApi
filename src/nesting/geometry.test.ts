@@ -8,6 +8,7 @@ import {
   polygonMinDistance,
   polygonsOverlap,
   rotateAroundCentroid,
+  simplifyToPointBudget,
 } from './geometry';
 
 describe('polygonArea', () => {
@@ -92,5 +93,36 @@ describe('rotateAroundCentroid', () => {
     const bb = boundingBox(rotated);
     assert.ok(Math.abs(bb.width - 10) < 1e-6);
     assert.ok(Math.abs(bb.height - 10) < 1e-6);
+  });
+});
+
+describe('simplifyToPointBudget', () => {
+  it('leaves a polygon untouched when it is already within budget', () => {
+    // Regression guard: a server-side "safety net" cap that fires on normally-sized, already-
+    // simplified parts silently overrides the client's own fidelity choice and can distort the
+    // contour features (notches, curves) that let parts nest tightly — this happened for real
+    // with a too-low cap and visibly made production jobs pack worse.
+    const rect: Polygon = [[0, 0], [10, 0], [10, 5], [0, 5]];
+    const result = simplifyToPointBudget(rect, 200, 0.1);
+    assert.deepEqual(result, rect);
+  });
+
+  it('keeps the simplified shape close to the original when it does need to simplify', () => {
+    // A circle approximated with 200 points, simplified down to a 30-point budget, should still
+    // look roughly like the same circle — not a wildly different shape or a degenerate result.
+    const n = 200, r = 50;
+    const circle: Polygon = Array.from({ length: n }, (_, i) => {
+      const t = (i / n) * Math.PI * 2;
+      return [r * Math.cos(t), r * Math.sin(t)] as [number, number];
+    });
+
+    const result = simplifyToPointBudget(circle, 30, 0.1);
+    assert.ok(result.length <= 30, `expected at most 30 points, got ${result.length}`);
+    assert.ok(result.length >= 3, `expected a valid polygon, got ${result.length} points`);
+
+    const originalArea = polygonArea(circle);
+    const simplifiedArea = polygonArea(result);
+    const areaChangePct = Math.abs(simplifiedArea - originalArea) / originalArea * 100;
+    assert.ok(areaChangePct < 10, `simplification changed area by ${areaChangePct.toFixed(1)}%, expected < 10%`);
   });
 });
