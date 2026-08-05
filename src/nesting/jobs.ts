@@ -4,6 +4,10 @@ import { NestingError, PackResult, PassBudget, SheetSize } from './types';
 
 export type JobStatus = 'pending' | 'running' | 'done' | 'error';
 
+function describeFootprints(result: PackResult): string {
+  return result.sheetFootprints.map((f) => `${f.width.toFixed(0)}x${f.height.toFixed(0)}mm`).join(', ');
+}
+
 export interface NestJobConfig {
   sheet: SheetSize;
   gap: number;
@@ -69,7 +73,7 @@ export function createJob(config: NestJobConfig): string {
       const now = Date.now();
       if (now - lastProgressLogAt >= PROGRESS_LOG_INTERVAL_MS) {
         lastProgressLogAt = now;
-        const bestInfo = best ? `best so far: ${best.sheetsUsed} sheet(s), ${best.utilizationPct.toFixed(1)}% used` : 'no valid arrangement yet';
+        const bestInfo = best ? `best so far: ${best.sheetsUsed} sheet(s) (${describeFootprints(best)}), ${best.utilizationPct.toFixed(1)}% used` : 'no valid arrangement yet';
         console.log(`[nest ${id}] progress: ${iterationsTried} attempt(s), ${(job.elapsedMs / 1000).toFixed(1)}s elapsed, ${bestInfo}`);
       }
     },
@@ -79,8 +83,8 @@ export function createJob(config: NestJobConfig): string {
       job.best = result;
       job.status = 'done';
       console.log(
-        `[nest ${id}] done: ${result.sheetsUsed} sheet(s), ${result.utilizationPct.toFixed(1)}% utilization, ` +
-        `${job.iterationsTried} attempt(s), ${(job.elapsedMs / 1000).toFixed(1)}s`
+        `[nest ${id}] done: ${result.sheetsUsed} sheet(s) (${describeFootprints(result)}), ` +
+        `${result.utilizationPct.toFixed(1)}% utilization, ${job.iterationsTried} attempt(s), ${(job.elapsedMs / 1000).toFixed(1)}s`
       );
     })
     .catch((e) => {

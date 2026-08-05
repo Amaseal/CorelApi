@@ -95,6 +95,8 @@ router.get('/jobs/:id/result', (req, res) => {
     utilizationPct: best.utilizationPct,
     sheets: Array.from({ length: best.sheetsUsed }, (_, sheetIndex) => ({
       index: sheetIndex,
+      footprintWidth: best.sheetFootprints[sheetIndex].width,
+      footprintHeight: best.sheetFootprints[sheetIndex].height,
       placements: best.placements
         .filter((p) => p.sheetIndex === sheetIndex)
         .map((p) => ({ instanceId: p.instanceId, partId: p.partId, x: p.x, y: p.y, rotationDeg: p.rotationDeg })),

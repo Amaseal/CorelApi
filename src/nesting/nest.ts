@@ -26,9 +26,18 @@ function expandInstances(parts: NestPart[]): PartInstance[] {
   return instances;
 }
 
+// Fewer sheets wins outright. Otherwise, prefer whichever arrangement actually consumed less
+// material — total footprint HEIGHT summed across sheets (not utilizationPct: for a fixed sheet
+// count, usedArea and the configured sheet size are both constant across every attempt, so that
+// percentage can never change no matter how much tighter one arrangement is than another — that
+// was the bug that made the optimizer look "stuck" after its very first attempt). Height, not
+// area, because sheet width is a hard constraint (roll width) while height/length is the actual
+// cost driver — mirrors e-cut's own framing (same width, shorter length = better).
 function isBetter(a: PackResult, b: PackResult): boolean {
   if (a.sheetsUsed !== b.sheetsUsed) return a.sheetsUsed < b.sheetsUsed;
-  return a.utilizationPct > b.utilizationPct;
+  const heightA = a.sheetFootprints.reduce((sum, f) => sum + f.height, 0);
+  const heightB = b.sheetFootprints.reduce((sum, f) => sum + f.height, 0);
+  return heightA < heightB;
 }
 
 function shuffled<T>(arr: T[]): T[] {

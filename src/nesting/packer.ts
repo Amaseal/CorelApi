@@ -1,5 +1,5 @@
 import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonMinDistance, polygonsOverlap, rotateAroundCentroid } from './geometry';
-import { NestingError, PackResult, PartInstance, Placement, RotationMode, SheetSize } from './types';
+import { NestingError, PackResult, PartInstance, Placement, RotationMode, SheetFootprint, SheetSize } from './types';
 
 const FREE_ROTATION_STEP_DEG = 15;
 
@@ -135,13 +135,25 @@ export async function packAttempt(sheet: SheetSize, gap: number, instances: Part
     }
   }
 
-  const sheetArea = sheet.width * sheet.height;
+  // Actual footprint per sheet — the tight bounding box of what got placed there, not the
+  // configured sheet size (which is only an upper bound, e.g. a generous roll-length allowance).
+  const sheetFootprints: SheetFootprint[] = sheetsPlaced.map((polys) => {
+    let maxX = 0, maxY = 0;
+    for (const poly of polys) {
+      const bb = boundingBox(poly);
+      if (bb.maxX > maxX) maxX = bb.maxX;
+      if (bb.maxY > maxY) maxY = bb.maxY;
+    }
+    return { width: maxX, height: maxY };
+  });
+
   const usedArea = instances.reduce((sum, p) => sum + netArea(p.outline, p.holes), 0);
-  const totalArea = sheetsPlaced.length * sheetArea;
+  const footprintArea = sheetFootprints.reduce((sum, f) => sum + f.width * f.height, 0);
 
   return {
     sheetsUsed: sheetsPlaced.length,
     placements,
-    utilizationPct: totalArea > 0 ? (usedArea / totalArea) * 100 : 0,
+    sheetFootprints,
+    utilizationPct: footprintArea > 0 ? (usedArea / footprintArea) * 100 : 0,
   };
 }

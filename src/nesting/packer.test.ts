@@ -43,6 +43,21 @@ describe('runNesting', () => {
     assert.equal(result.placements[0].rotationDeg, 0);
   });
 
+  it('scores utilization against the actual placed footprint, not the nominal sheet size', async () => {
+    // Regression test: utilization used to be usedArea / (sheetsUsed * configuredSheetArea).
+    // For a single sheet, both of those are constant across every attempt regardless of how
+    // tightly packed the arrangement actually is, which made the optimizer look "stuck" — it
+    // could never recognize a genuinely better arrangement because the score never moved.
+    const parts = [{ partId: 'a', outline: rect(10, 10), holes: [], rotationMode: 'locked' as const, quantity: 1 }];
+    const result = await runNesting({ width: 500, height: 500 }, 0, parts, { maxIterations: 1 }, noProgress, neverCancelled);
+
+    assert.ok(result.sheetFootprints[0].width <= 10 + 1e-6, `footprint width should track the part, got ${result.sheetFootprints[0].width}`);
+    assert.ok(result.sheetFootprints[0].height <= 10 + 1e-6, `footprint height should track the part, got ${result.sheetFootprints[0].height}`);
+    // Against the tight 10x10 footprint this should be ~100%; against the nominal 500x500 sheet
+    // it would be ~0.04% — a result in the high range proves it's scored against the footprint.
+    assert.ok(result.utilizationPct > 90, `expected utilization scored against the footprint, got ${result.utilizationPct}%`);
+  });
+
   it('reports progress and honors cancellation', async () => {
     const parts = [{ partId: 'a', outline: rect(10, 10), holes: [], rotationMode: 'free' as const, quantity: 4 }];
     let calls = 0;

@@ -25,9 +25,18 @@ export interface Placement {
   outline: Polygon;
 }
 
+export interface SheetFootprint {
+  width: number;
+  height: number;
+}
+
 export interface PackResult {
   sheetsUsed: number;
   placements: Placement[];
+  // Actual bounding size of the placed parts on each sheet — NOT the configured sheet size,
+  // which is only an upper bound. This is what should drive both the optimizer's scoring and
+  // any "how much material did this actually use" reporting (e.g. roll length consumed).
+  sheetFootprints: SheetFootprint[];
   utilizationPct: number;
 }
 
