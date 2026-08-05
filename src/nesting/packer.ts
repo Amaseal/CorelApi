@@ -1,4 +1,5 @@
-import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid } from './geometry';
+import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
+import { nfpAnchors } from './nfp';
 import { NestingError, PackResult, PartInstance, Placement, RotationMode, SheetFootprint, SheetSize } from './types';
 
 const FREE_ROTATION_STEP_DEG = 15;
@@ -11,15 +12,46 @@ function rotationsFor(mode: RotationMode): number[] {
   return angles;
 }
 
-// Candidate bottom-left anchor points: sheet origin plus every VERTEX of every already-placed
-// part's actual outline. This is a cheap stand-in for a full no-fit-polygon touching-point
-// search: using real polygon vertices — not just bounding-box corners — lets the candidate's
-// corner land snug against a concave notch, an angled edge, or any other contour feature a
-// coarse bbox-corner grid is blind to, without computing Minkowski sums. It's still an
-// approximation (only the candidate's own bbox-min corner is tried against these points, not
-// every vertex pairing), but it's a meaningfully closer approximation to a real touching-point
-// search than bounding boxes alone.
-function candidateAnchors(sheet: SheetSize, placed: Polygon[]): Point[] {
+function normalizeToOrigin(poly: Polygon): Polygon {
+  const bb = boundingBox(poly);
+  return translate(poly, -bb.minX, -bb.minY);
+}
+
+// Minkowski-diff NFP computation cost scales with both polygons' point counts, and measured
+// ~200-270ms for a single call between two ~55-point concave outlines — far too slow to call
+// once per (rotation, obstacle) pair at real part counts (SVGnest hits the same wall, which is
+// why it leans on Web Workers for parallelism). Two bounded mitigations instead of parallelism:
+// a much lighter proxy shape used ONLY for NFP search (the actual placed/output geometry is
+// untouched — full detail is still exactly validated by fitsOnSheet below), and limiting NFP
+// computation to the nearest few obstacles, since a part on the other side of the sheet is
+// essentially never going to constrain the best low position anyway.
+const NFP_SEARCH_POINTS = 18;
+const MAX_NFP_OBSTACLES = 6;
+
+function bboxCenter(poly: Polygon): Point {
+  const bb = boundingBox(poly);
+  return [(bb.minX + bb.maxX) / 2, (bb.minY + bb.maxY) / 2];
+}
+
+function nearestObstacles(target: Polygon, placed: Polygon[], k: number): Polygon[] {
+  if (placed.length <= k) return placed;
+  const [tx, ty] = bboxCenter(target);
+  return [...placed]
+    .sort((a, b) => {
+      const [ax, ay] = bboxCenter(a);
+      const [bx, by] = bboxCenter(b);
+      return ((ax - tx) ** 2 + (ay - ty) ** 2) - ((bx - tx) ** 2 + (by - ty) ** 2);
+    })
+    .slice(0, k);
+}
+
+// Candidate bottom-left anchor points for placing `movingNormalized` (a candidate part's rotated
+// outline, translated so its own bbox-min corner sits at (0,0)) against the nearest already-placed
+// parts on this sheet: the sheet origin, plus every vertex of the true no-fit-polygon computed
+// against each nearby obstacle (via Minkowski difference — see nfp.ts). Each NFP vertex is an
+// exact touching position for the (simplified) search shapes, not an approximation — the actual
+// placement is still validated at full detail by fitsOnSheet before being accepted.
+function candidateAnchorsForRotation(sheet: SheetSize, placed: Polygon[], movingNormalized: Polygon, gap: number): Point[] {
   const seen = new Set<string>();
   const anchors: Point[] = [];
 
@@ -32,21 +64,21 @@ function candidateAnchors(sheet: SheetSize, placed: Polygon[]): Point[] {
   };
 
   tryAdd(0, 0);
-  for (const poly of placed) {
-    for (const [x, y] of poly) tryAdd(x, y);
+
+  const searchMoving = simplifyToPointBudget(movingNormalized, NFP_SEARCH_POINTS, 0.5);
+  for (const obstacle of nearestObstacles(movingNormalized, placed, MAX_NFP_OBSTACLES)) {
+    const searchObstacle = simplifyToPointBudget(obstacle, NFP_SEARCH_POINTS, 0.5);
+    for (const [x, y] of nfpAnchors(searchObstacle, searchMoving, gap)) tryAdd(x, y);
   }
 
   anchors.sort((p1, p2) => p1[1] - p2[1] || p1[0] - p2[0]);
-  // Bottom-left-fill only ever prefers the lowest-y (then lowest-x) candidates anyway — once the
-  // placed-part count makes the full vertex list large, the highest ones are essentially never
-  // reached before an earlier one already fits. Capping keeps cost from growing without bound as
-  // a job's part/vertex count grows, at the cost of occasionally missing a valid low spot that
-  // happened to sort past the cap (rare, and the multi-attempt search can still find it via a
-  // different ordering).
   return anchors.length > MAX_ANCHORS ? anchors.slice(0, MAX_ANCHORS) : anchors;
 }
 
-const MAX_ANCHORS = 150;
+// A generous cap, not a routine limiter — NFP-based candidates are already naturally bounded by
+// obstacle complexity (unlike the old vertex-list approximation), this just guards against a
+// pathological case (many obstacles, each contributing a detailed NFP) piling up unbounded.
+const MAX_ANCHORS = 300;
 
 function fitsOnSheet(poly: Polygon, sheet: SheetSize, placed: Polygon[], gap: number): boolean {
   const bb = boundingBox(poly);
@@ -76,11 +108,12 @@ interface PlacementCandidate {
 // rotations. Trying more than one keeps a downstream beam search from committing to the first
 // workable spot the way a plain greedy placer does.
 function tryPlacePartTopK(part: PartInstance, sheet: SheetSize, placed: Polygon[], gap: number, k: number): PlacementCandidate[] {
-  const anchors = candidateAnchors(sheet, placed);
   const perRotationBest: PlacementCandidate[] = [];
 
   for (const rot of rotationsFor(part.rotationMode)) {
     const rotated = rotateAroundCentroid(part.outline, rot);
+    const normalized = normalizeToOrigin(rotated);
+    const anchors = candidateAnchorsForRotation(sheet, placed, normalized, gap);
     for (const anchor of anchors) {
       const candidate = placeAtAnchor(rotated, anchor);
       if (fitsOnSheet(candidate, sheet, placed, gap)) {
@@ -153,8 +186,8 @@ function scoreIsBetter(a: StateScore, b: StateScore): boolean {
 // product (roughly BEAM_WIDTH times the cost of the old single-best placer, since each state
 // independently searches all rotations/anchors) — kept modest so a full pass through all parts
 // stays fast enough for many attempts to still fit in a time budget, on top of this.
-const BEAM_WIDTH = 2;
-const CANDIDATES_PER_PART = 2;
+const BEAM_WIDTH = 1;
+const CANDIDATES_PER_PART = 3;
 
 // Node is single-threaded, and this loop is the only CPU-heavy part of the whole API — with many
 // parts (candidate anchors grow with placed count) and free rotation (24 angles tried per part),
