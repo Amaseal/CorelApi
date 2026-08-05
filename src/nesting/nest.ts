@@ -49,6 +49,34 @@ function shuffled<T>(arr: T[]): T[] {
   return copy;
 }
 
+// A small, local change to an ordering: either swap two parts' positions or move one part
+// elsewhere in the sequence. Placement order drives the greedy packer's outcome, so this is
+// effectively "try the current best arrangement with one part placed a bit differently" —
+// exactly the kind of one-part tweak that turns a good arrangement into a great one, and which
+// a full reshuffle (below) essentially never lands on by chance with any real number of parts.
+function perturbed<T>(order: T[]): T[] {
+  const copy = [...order];
+  const n = copy.length;
+  if (n < 2) return copy;
+
+  if (Math.random() < 0.5) {
+    const i = Math.floor(Math.random() * n);
+    let j = Math.floor(Math.random() * n);
+    if (j === i) j = (j + 1) % n;
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  } else {
+    const i = Math.floor(Math.random() * n);
+    const item = copy.splice(i, 1)[0];
+    const j = Math.floor(Math.random() * copy.length);
+    copy.splice(j, 0, item);
+  }
+  return copy;
+}
+
+// Fraction of attempts that fully reshuffle instead of refining the current best — keeps the
+// search able to escape a poor local optimum instead of only ever polishing its first one.
+const FULL_RESHUFFLE_PROBABILITY = 0.15;
+
 // Runs repeated bottom-left-fill packing attempts (mirrors e-cut's "try for N seconds / N times,
 // keep the best" passes), yielding between attempts so job status can be polled and cancelled.
 export async function runNesting(
@@ -70,16 +98,19 @@ export async function runNesting(
 
   const start = Date.now();
   let best: PackResult | null = null;
+  let bestOrder: PartInstance[] | null = null;
   let iterations = 0;
 
   // First pass is deterministic (largest part first — a solid baseline heuristic).
-  // Subsequent passes randomize placement order to explore other arrangements.
   let order = [...baseInstances].sort((a, b) => netArea(b.outline, b.holes) - netArea(a.outline, a.holes));
 
   while (iterations < maxIterations && Date.now() - start < timeBudgetMs && !isCancelled()) {
     try {
       const result = await packAttempt(sheet, gap, order);
-      if (!best || isBetter(result, best)) best = result;
+      if (!best || isBetter(result, best)) {
+        best = result;
+        bestOrder = order;
+      }
     } catch (e) {
       if (!(e instanceof NestingError)) throw e;
       // This ordering couldn't even fit something on an empty sheet — a fundamental sizing
@@ -92,7 +123,10 @@ export async function runNesting(
 
     if (iterations >= maxIterations || Date.now() - start >= timeBudgetMs || isCancelled()) break;
     await new Promise<void>((resolve) => setImmediate(resolve));
-    order = shuffled(baseInstances);
+
+    // Mostly refine the current best arrangement with a small local tweak; occasionally reshuffle
+    // fully so the search isn't permanently stuck polishing whatever local optimum it found first.
+    order = (bestOrder && Math.random() >= FULL_RESHUFFLE_PROBABILITY) ? perturbed(bestOrder) : shuffled(baseInstances);
   }
 
   if (!best) throw new NestingError('Nesting failed: no arrangement found');
