@@ -1,5 +1,5 @@
 import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
-import { nfpAnchors } from './nfp';
+import { inflate, nfpAnchors } from './nfp';
 import { NestingError, PackResult, PartInstance, Placement, RotationMode, SheetFootprint, SheetSize } from './types';
 
 const FREE_ROTATION_STEP_DEG = 15;
@@ -17,40 +17,37 @@ function normalizeToOrigin(poly: Polygon): Polygon {
   return translate(poly, -bb.minX, -bb.minY);
 }
 
-// Minkowski-diff NFP computation cost scales with both polygons' point counts, and measured
-// ~200-270ms for a single call between two ~55-point concave outlines — far too slow to call
-// once per (rotation, obstacle) pair at real part counts (SVGnest hits the same wall, which is
-// why it leans on Web Workers for parallelism). Two bounded mitigations instead of parallelism:
-// a much lighter proxy shape used ONLY for NFP search (the actual placed/output geometry is
-// untouched — full detail is still exactly validated by fitsOnSheet below), and limiting NFP
-// computation to the nearest few obstacles, since a part on the other side of the sheet is
-// essentially never going to constrain the best low position anyway.
-const NFP_SEARCH_POINTS = 18;
-const MAX_NFP_OBSTACLES = 6;
+// Minkowski-diff NFP computation cost scales with both polygons' point counts. Quality matters
+// more than speed here — this is a lighter proxy shape used ONLY for NFP search (the actual
+// placed/output geometry is untouched — full detail is still exactly validated by fitsOnSheet
+// below), kept moderate rather than pushed as low as possible, since NFP precision is what
+// candidate quality (and therefore the final nest) actually depends on.
+const NFP_SEARCH_POINTS = 40;
 
-function bboxCenter(poly: Polygon): Point {
-  const bb = boundingBox(poly);
-  return [(bb.minX + bb.maxX) / 2, (bb.minY + bb.maxY) / 2];
-}
+// Simplifying AND gap-inflating an obstacle doesn't depend on the moving part's rotation at all,
+// but was being redone from scratch for every one of the (up to 24) rotations tried per part —
+// pure wasted, and expensive, work. This caches the prepared search-proxy per obstacle polygon
+// (keyed by object identity, which is stable across rotations/parts/attempts since sheets are
+// built via structural sharing — see packAttempt), so each unique placed part only ever pays for
+// simplify+inflate once, no matter how many times it's checked as an obstacle afterwards. This
+// turned out to be the dominant cost behind gap>0 being so much slower than gap=0.
+const searchObstacleCache = new WeakMap<Polygon, Polygon>();
 
-function nearestObstacles(target: Polygon, placed: Polygon[], k: number): Polygon[] {
-  if (placed.length <= k) return placed;
-  const [tx, ty] = bboxCenter(target);
-  return [...placed]
-    .sort((a, b) => {
-      const [ax, ay] = bboxCenter(a);
-      const [bx, by] = bboxCenter(b);
-      return ((ax - tx) ** 2 + (ay - ty) ** 2) - ((bx - tx) ** 2 + (by - ty) ** 2);
-    })
-    .slice(0, k);
+function prepareSearchObstacle(obstacle: Polygon, gap: number): Polygon {
+  const cached = searchObstacleCache.get(obstacle);
+  if (cached) return cached;
+  const simplified = simplifyToPointBudget(obstacle, NFP_SEARCH_POINTS, 0.5);
+  const prepared = gap > 0 ? inflate(simplified, gap) : simplified;
+  searchObstacleCache.set(obstacle, prepared);
+  return prepared;
 }
 
 // Candidate bottom-left anchor points for placing `movingNormalized` (a candidate part's rotated
-// outline, translated so its own bbox-min corner sits at (0,0)) against the nearest already-placed
-// parts on this sheet: the sheet origin, plus every vertex of the true no-fit-polygon computed
-// against each nearby obstacle (via Minkowski difference — see nfp.ts). Each NFP vertex is an
-// exact touching position for the (simplified) search shapes, not an approximation — the actual
-// placement is still validated at full detail by fitsOnSheet before being accepted.
+// outline, translated so its own bbox-min corner sits at (0,0)) against every already-placed part
+// on this sheet: the sheet origin, plus every vertex of the true no-fit-polygon computed against
+// each obstacle (via Minkowski difference — see nfp.ts). Each NFP vertex is an exact touching
+// position for the (simplified) search shapes, not an approximation — the actual placement is
+// still validated at full detail by fitsOnSheet before being accepted.
 function candidateAnchorsForRotation(sheet: SheetSize, placed: Polygon[], movingNormalized: Polygon, gap: number): Point[] {
   const seen = new Set<string>();
   const anchors: Point[] = [];
@@ -66,9 +63,11 @@ function candidateAnchorsForRotation(sheet: SheetSize, placed: Polygon[], moving
   tryAdd(0, 0);
 
   const searchMoving = simplifyToPointBudget(movingNormalized, NFP_SEARCH_POINTS, 0.5);
-  for (const obstacle of nearestObstacles(movingNormalized, placed, MAX_NFP_OBSTACLES)) {
-    const searchObstacle = simplifyToPointBudget(obstacle, NFP_SEARCH_POINTS, 0.5);
-    for (const [x, y] of nfpAnchors(searchObstacle, searchMoving, gap)) tryAdd(x, y);
+  for (const obstacle of placed) {
+    const searchObstacle = prepareSearchObstacle(obstacle, gap);
+    // gap already baked into searchObstacle above (or n/a if gap<=0) — pass 0 here so nfpAnchors
+    // doesn't redundantly inflate it again itself.
+    for (const [x, y] of nfpAnchors(searchObstacle, searchMoving, 0)) tryAdd(x, y);
   }
 
   anchors.sort((p1, p2) => p1[1] - p2[1] || p1[0] - p2[0]);
@@ -182,11 +181,10 @@ function scoreIsBetter(a: StateScore, b: StateScore): boolean {
 }
 
 // How many partial arrangements are carried forward after each part, and how many placement
-// options are considered per part for each of them. Beam search's cost scales with their
-// product (roughly BEAM_WIDTH times the cost of the old single-best placer, since each state
-// independently searches all rotations/anchors) — kept modest so a full pass through all parts
-// stays fast enough for many attempts to still fit in a time budget, on top of this.
-const BEAM_WIDTH = 1;
+// options are considered per part for each of them. Beam search's cost scales with their product
+// (roughly BEAM_WIDTH times the cost of a single-best placer, since each state independently
+// searches all rotations/anchors) — prioritizing result quality over speed for now.
+const BEAM_WIDTH = 2;
 const CANDIDATES_PER_PART = 3;
 
 // Node is single-threaded, and this loop is the only CPU-heavy part of the whole API — with many

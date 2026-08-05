@@ -23,7 +23,7 @@ function fromClipperPath(path: ClipperLib.Path): Point[] {
 // basic shape typing, and every ClipperLib.* member used here (EndType.etClosedPolygon,
 // JoinType.jtMiter, ClipperOffset, Clipper.MinkowskiDiff) was confirmed against the actual
 // runtime export list rather than assumed from the type declarations.
-function inflate(poly: Polygon, delta: number): Polygon {
+export function inflate(poly: Polygon, delta: number): Polygon {
   if (delta <= 0) return poly;
   const co = new ClipperLib.ClipperOffset();
   co.AddPath(toClipperPath(poly), ClipperLib.JoinType.jtMiter, ClipperLib.EndType.etClosedPolygon);
