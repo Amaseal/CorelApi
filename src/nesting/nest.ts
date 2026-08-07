@@ -1,4 +1,4 @@
-import { Polygon, minAreaBoundingRectAngle, netArea } from './geometry';
+import { Polygon, boundingBox, minAreaBoundingRectAngle, netArea } from './geometry';
 import { packAttempt } from './packer';
 import { NestingError, PackResult, PartInstance, PassBudget, RotationMode, SheetSize } from './types';
 
@@ -104,7 +104,14 @@ function shuffled<T>(arr: T[]): T[] {
   return copy;
 }
 
-const POPULATION_SIZE = 10;
+// Sized for the packer's per-attempt cost, which is no longer cheap: since packAttempt now runs a
+// full compaction pass after the greedy placement (see packer.ts's compactSheet), one attempt
+// costs several seconds, not ~1s. A population of 10 needs 10 evaluations just to complete a
+// single generation — measured to blow almost an entire 60s budget on ONE ungoverned population,
+// meaning crossover/selection/elitism never fired even once (confirmed by a real run where the
+// best result was byte-for-byte identical across all 9 attempts that fit in the budget). Smaller
+// so several real generations — where the GA's actual value comes from — fit in a realistic budget.
+const POPULATION_SIZE = 6;
 // Order mutation now relocates a part to ANY position (see mutate() below) instead of swapping
 // with a neighbor — a much stronger move. At the old 0.1 rate that's ~1.7 of 17 parts randomly
 // relocated per individual per generation, which measured as too disruptive for good structure to
@@ -219,8 +226,24 @@ export async function runNesting(
   const adam = [...baseInstances]
     .sort((a, b) => netArea(b.outline, b.holes) - netArea(a.outline, a.holes))
     .map((p) => ({ ...p, rotationDeg: snappedAutoAngle(p.rotationMode, autoAngles.get(p.partId) ?? 0) }));
-  let population: PartInstance[][] = [adam];
-  for (let i = 1; i < POPULATION_SIZE; i++) population.push(randomIndividual(baseInstances, autoAngles));
+
+  // A second deterministic seed, sorted by bounding-box area (not true polygon area) with every
+  // part left at rotation 0 (not the auto angle) — measured directly on a real job to land within
+  // ~1% of e-cut's own benchmark on a single try, dramatically better than "adam" above. A random
+  // shuffle of 17 parts essentially never rediscovers a specific ordering like this one on its own
+  // within a realistic attempt budget, so it's seeded explicitly rather than left to chance.
+  // Bbox-area ranking (vs. true polygon area) tends to front-load parts whose real footprint is
+  // much smaller than their bounding box (e.g. long/thin or heavily notched shapes) earlier, which
+  // apparently leaves better-shaped gaps for everything placed after them.
+  const adamBboxUnrotated = [...baseInstances]
+    .sort((a, b) => {
+      const areaOf = (p: PartInstance) => boundingBox(p.outline).width * boundingBox(p.outline).height;
+      return areaOf(b) - areaOf(a);
+    })
+    .map((p) => ({ ...p, rotationDeg: 0 }));
+
+  let population: PartInstance[][] = [adam, adamBboxUnrotated];
+  for (let i = population.length; i < POPULATION_SIZE; i++) population.push(randomIndividual(baseInstances, autoAngles));
 
   while (withinBudget()) {
     const scored: { individual: PartInstance[]; fitness: number }[] = [];

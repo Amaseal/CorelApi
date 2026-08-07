@@ -1,5 +1,5 @@
-import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, insertOnEdge, nearestPointOnLoops, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
-import { inflate, nfpLoops, unionPolygons } from './nfp';
+import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
+import { inflate, nfpLoops } from './nfp';
 import { NestingError, PackResult, PartInstance, Placement, SheetFootprint, SheetSize } from './types';
 
 function normalizeToOrigin(poly: Polygon): Polygon {
@@ -59,62 +59,15 @@ function candidateAnchors(sheet: SheetSize, perObstacleLoops: Polygon[][]): Poin
   return anchors.length > MAX_ANCHORS ? anchors.slice(0, MAX_ANCHORS) : anchors;
 }
 
-// Safety cap on how many boundary vertices a single slide direction will step through — the walk
-// already stops as soon as a step fails to strictly improve the score, so this only guards against
-// a pathological cycle (e.g. floating-point noise making two adjacent points compare as endlessly
-// "equal-ish"), not a normal termination condition.
-const SLIDE_MAX_STEPS = 200;
-
-// A candidate part often lands touching one obstacle at a point where sliding it further (along
-// that obstacle's own edge, or past it onto a second obstacle's edge) would pack it tighter than
-// any single NFP vertex does on its own — e.g. resting against a straight edge partway between two
-// of that edge's endpoints, or rounding a corner from one obstacle's boundary onto a neighbor's.
-// `boundaryLoops` is the union of every obstacle's NFP (see unionPolygons) — its edges are exactly
-// the set of positions where the moving shape touches at least one obstacle without overlapping
-// any of them — so walking vertex-to-vertex along it from the best anchor found above, in
-// whichever direction keeps improving the placement score, finds these in-between resting spots
-// without needing a physics simulation.
-function slideAlongBoundary(
-  boundaryLoops: Polygon[],
-  startAnchor: Point,
-  startScore: number,
-  evaluate: (anchor: Point) => number | null,
-): { anchor: Point; score: number } | null {
-  if (boundaryLoops.length === 0) return null;
-
-  const located = nearestPointOnLoops(startAnchor, boundaryLoops);
-  // Only slide from a point that's actually (close to) on this boundary — e.g. the sheet-origin
-  // anchor generally isn't constrained by any obstacle at all, so there's nothing to slide along.
-  if (!located || located.dist > 0.05) return null;
-
-  const { loop, index: startIndex } = insertOnEdge(
-    boundaryLoops[located.loopIndex], located.edgeIndex, located.t, located.point,
-  );
-  if (loop.length < 2) return null;
-
-  let bestAnchor = startAnchor;
-  let bestScore = startScore;
-
-  for (const direction of [1, -1] as const) {
-    let idx = startIndex;
-    let currentScore = startScore;
-    for (let step = 0; step < SLIDE_MAX_STEPS; step++) {
-      idx = (idx + direction + loop.length) % loop.length;
-      if (idx === startIndex) break; // walked all the way around back to the start
-      const candidateScore = evaluate(loop[idx]);
-      if (candidateScore === null || candidateScore >= currentScore - EPS) break; // invalid, or no longer improving
-      currentScore = candidateScore;
-      if (currentScore < bestScore) { bestScore = currentScore; bestAnchor = loop[idx]; }
-    }
-  }
-
-  return bestScore < startScore - EPS ? { anchor: bestAnchor, score: bestScore } : null;
-}
-
-// A generous cap, not a routine limiter — NFP-based candidates are already naturally bounded by
-// obstacle complexity, this just guards against a pathological case (many obstacles, each
-// contributing a detailed NFP) piling up unbounded.
-const MAX_ANCHORS = 300;
+// A true pathological-case guard, not a routine limiter — measured directly on a real 17-part job
+// that candidate counts climb past 300-450+ by the time 8-13 parts are already placed, which is
+// completely normal, not pathological. The old 300 cap was silently truncating past that on every
+// real job of this size — and since candidates are sorted lowest-Y-first before truncating, what
+// got discarded was specifically the candidates sitting in open space ABOVE a tall stack, which is
+// exactly where a part needs to go once the space near y=0 is full. That caused real, valid
+// single-sheet layouts to spuriously overflow onto a second sheet, since the search never even
+// considered the wide-open space that was actually available.
+const MAX_ANCHORS = 5000;
 
 function fitsOnSheet(poly: Polygon, sheet: SheetSize, placed: Polygon[], gap: number): boolean {
   const bb = boundingBox(poly);
@@ -132,6 +85,45 @@ function fitsOnSheet(poly: Polygon, sheet: SheetSize, placed: Polygon[], gap: nu
   return true;
 }
 
+interface BaseBBox {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+}
+
+// The combined bounding box of a set of already-placed outlines — a phantom (0,0)-(0,0) point
+// when there are none, so even the very first part placed on a sheet is scored against the
+// origin (matching the sheet-origin anchor candidate below). Precomputed once per tryPlaceOnSheet
+// call (not per candidate) since it doesn't depend on the candidate being scored.
+function computeBaseBBox(others: Polygon[]): BaseBBox {
+  if (others.length === 0) return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of others) {
+    const bb = boundingBox(p);
+    if (bb.minX < minX) minX = bb.minX;
+    if (bb.minY < minY) minY = bb.minY;
+    if (bb.maxX > maxX) maxX = bb.maxX;
+    if (bb.maxY > maxY) maxY = bb.maxY;
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+// The resulting overall bounding box if `candidate` joins `base` — height weighted more than
+// width. Sheet width is a hard, fixed cap (roll width, already "paid for" whether used or not);
+// height is the actual cost driver (roll length consumed — see nest.ts's isBetter). A part that
+// can settle at a taller-but-narrower spot vs. a shorter-but-wider one should prefer the wider
+// one, since unused width is pure waste it could have traded for less height. This was previously
+// weighted the other way (width * 2 + height) and measured to actively leave width unused on a
+// real job — e.g. one real result used only 1062mm of a 1312mm-wide sheet while growing to
+// 1358mm tall, when spreading into that spare ~250mm of width had real room to reduce height.
+function footprintScoreAgainst(candidate: Polygon, base: BaseBBox): number {
+  const bb = boundingBox(candidate);
+  const width = Math.max(base.maxX, bb.maxX) - Math.min(base.minX, bb.minX);
+  const height = Math.max(base.maxY, bb.maxY) - Math.min(base.minY, bb.minY);
+  return width + height * 2;
+}
+
 interface PlacementResult {
   outline: Polygon;
 }
@@ -142,12 +134,11 @@ interface PlacementResult {
 // many attempts, not from exhaustively re-trying every angle inside each one).
 //
 // Among all valid candidate positions, picks whichever leaves the SMALLEST resulting overall
-// bounding box (width weighted more than height, matching e-cut/SVGnest's own placement
-// heuristic — "compress in the direction of gravity") — not simply the lowest-Y position. Pure
-// lowest-Y was measured to squeeze a small part into a leftover gap deep inside an already-placed
-// concave shape's own bounding box (technically valid, zero overlap) while leaving large, genuinely
-// open areas elsewhere on the sheet untouched, since a tight nook 8 shapes deep in can still sort
-// as "lower" than open space that happens to start slightly higher up.
+// bounding box (see footprintScoreAgainst) — not simply the lowest-Y position. Pure lowest-Y was
+// measured to squeeze a small part into a leftover gap deep inside an already-placed concave
+// shape's own bounding box (technically valid, zero overlap) while leaving large, genuinely open
+// areas elsewhere on the sheet untouched, since a tight nook 8 shapes deep in can still sort as
+// "lower" than open space that happens to start slightly higher up.
 function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[], gap: number): PlacementResult | null {
   const rotated = rotateAroundCentroid(part.outline, part.rotationDeg);
   const normalized = normalizeToOrigin(rotated);
@@ -157,41 +148,17 @@ function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[]
   // with gap 0 here to avoid inflating it a second time.
   const perObstacleLoops = placed.map((obstacle) => nfpLoops(prepareSearchObstacle(obstacle, gap), searchMoving, 0));
   const anchors = candidateAnchors(sheet, perObstacleLoops);
-
-  let baseMinX = 0, baseMinY = 0, baseMaxX = 0, baseMaxY = 0;
-  if (placed.length > 0) {
-    baseMinX = Infinity; baseMinY = Infinity; baseMaxX = -Infinity; baseMaxY = -Infinity;
-    for (const p of placed) {
-      const bb = boundingBox(p);
-      if (bb.minX < baseMinX) baseMinX = bb.minX;
-      if (bb.minY < baseMinY) baseMinY = bb.minY;
-      if (bb.maxX > baseMaxX) baseMaxX = bb.maxX;
-      if (bb.maxY > baseMaxY) baseMaxY = bb.maxY;
-    }
-  }
-
-  const evaluate = (anchor: Point): number | null => {
-    const candidate = placeAtAnchor(rotated, anchor);
-    if (!fitsOnSheet(candidate, sheet, placed, gap)) return null;
-    const bb = boundingBox(candidate);
-    const width = Math.max(baseMaxX, bb.maxX) - Math.min(baseMinX, bb.minX);
-    const height = Math.max(baseMaxY, bb.maxY) - Math.min(baseMinY, bb.minY);
-    return width * 2 + height;
-  };
+  const base = computeBaseBBox(placed);
 
   let bestAnchor: Point | null = null;
   let bestScore = Infinity;
   for (const anchor of anchors) {
-    const score = evaluate(anchor);
-    if (score !== null && score < bestScore) { bestScore = score; bestAnchor = anchor; }
+    const candidate = placeAtAnchor(rotated, anchor);
+    if (!fitsOnSheet(candidate, sheet, placed, gap)) continue;
+    const score = footprintScoreAgainst(candidate, base);
+    if (score < bestScore) { bestScore = score; bestAnchor = anchor; }
   }
   if (!bestAnchor) return null;
-
-  if (placed.length > 0) {
-    const boundaryLoops = unionPolygons(perObstacleLoops.flat());
-    const slid = slideAlongBoundary(boundaryLoops, bestAnchor, bestScore, evaluate);
-    if (slid) { bestAnchor = slid.anchor; bestScore = slid.score; }
-  }
 
   return { outline: placeAtAnchor(rotated, bestAnchor) };
 }
