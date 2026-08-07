@@ -105,7 +105,14 @@ function shuffled<T>(arr: T[]): T[] {
 }
 
 const POPULATION_SIZE = 10;
-const MUTATION_RATE = 0.1;
+// Order mutation now relocates a part to ANY position (see mutate() below) instead of swapping
+// with a neighbor — a much stronger move. At the old 0.1 rate that's ~1.7 of 17 parts randomly
+// relocated per individual per generation, which measured as too disruptive for good structure to
+// survive from one generation to the next (results got WORSE, not better, after making the move
+// operator stronger without lowering its rate to compensate). Kept low so mutation reads as
+// occasional, surgical jumps rather than wholesale reshuffling.
+const ORDER_MUTATION_RATE = 0.03;
+const ROTATION_MUTATION_RATE = 0.1;
 const RANDOM_IMMIGRANTS_PER_GEN = 2;
 
 // Rank-based weighted selection favoring fitter individuals: `sortedPop` must already be sorted
@@ -145,22 +152,31 @@ function crossover(parentA: PartInstance[], parentB: PartInstance[]): [PartInsta
   return [childA, childB];
 }
 
-// Per-gene mutation: with MUTATION_RATE probability, swap a part with its neighbor in the
-// sequence; independently, with MUTATION_RATE probability, reroll its rotation to a new legal
-// angle. Clones instances (rather than mutating shared objects) since the same PartInstance
-// reference is shared across many individuals via the crossover above.
+// Per-gene mutation: with ORDER_MUTATION_RATE probability, moves a part to a random new position
+// in the sequence (NOT a swap with its neighbor — that can only ever shift an element by one slot
+// per mutation event, which measured as far too weak to escape a structural local optimum within
+// a practical number of generations; a real live run plateaued at attempt 33 of ~103 with zero
+// improvement afterward). Independently, with ROTATION_MUTATION_RATE probability, rerolls a
+// part's rotation to a new legal angle. Clones instances (rather than mutating shared objects)
+// since the same PartInstance reference is shared across many individuals via crossover.
 function mutate(individual: PartInstance[], autoAngles: Map<string, number>): PartInstance[] {
   const result = individual.map((p) => ({ ...p }));
+
   for (let i = 0; i < result.length; i++) {
-    if (Math.random() < MUTATION_RATE) {
-      const j = (i + 1) % result.length;
-      [result[i], result[j]] = [result[j], result[i]];
+    if (Math.random() < ORDER_MUTATION_RATE) {
+      const item = result.splice(i, 1)[0];
+      const j = Math.floor(Math.random() * result.length);
+      result.splice(j, 0, item);
     }
-    if (Math.random() < MUTATION_RATE) {
+  }
+
+  for (let i = 0; i < result.length; i++) {
+    if (Math.random() < ROTATION_MUTATION_RATE) {
       const autoAngle = autoAngles.get(result[i].partId) ?? 0;
       result[i] = { ...result[i], rotationDeg: randomLegalRotation(result[i].rotationMode, autoAngle) };
     }
   }
+
   return result;
 }
 

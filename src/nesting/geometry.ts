@@ -309,6 +309,49 @@ export function simplifyToPointBudget(pts: Polygon, maxPoints: number, startTole
   return result;
 }
 
+export interface BoundaryLocation {
+  loopIndex: number;
+  edgeIndex: number;
+  t: number; // 0..1 along the edge from its start vertex
+  point: Point;
+  dist: number;
+}
+
+// Finds the closest point across every edge of every loop to `point`. Used to locate a position
+// (typically an already-known touching point, e.g. an NFP vertex) on a boundary that was computed
+// separately (e.g. by unioning several NFPs together), so a search can start walking from there.
+export function nearestPointOnLoops(point: Point, loops: Polygon[]): BoundaryLocation | null {
+  let best: BoundaryLocation | null = null;
+  for (let li = 0; li < loops.length; li++) {
+    const loop = loops[li];
+    for (let ei = 0; ei < loop.length; ei++) {
+      const a = loop[ei], b = loop[(ei + 1) % loop.length];
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      const lenSq = dx * dx + dy * dy;
+      let t = lenSq < EPS ? 0 : ((point[0] - a[0]) * dx + (point[1] - a[1]) * dy) / lenSq;
+      t = Math.max(0, Math.min(1, t));
+      const cx = a[0] + t * dx, cy = a[1] + t * dy;
+      const dist = Math.hypot(point[0] - cx, point[1] - cy);
+      if (!best || dist < best.dist) best = { loopIndex: li, edgeIndex: ei, t, point: [cx, cy], dist };
+    }
+  }
+  return best;
+}
+
+// Splits `loop`'s edge at `edgeIndex` by inserting `point` as a new vertex there (unless `t` puts
+// it essentially on one of the edge's existing endpoints, in which case that vertex is reused
+// as-is). Returns the augmented loop and the index of `point` within it — turns a
+// BoundaryLocation into a concrete starting index for a vertex-to-vertex walk.
+export function insertOnEdge(loop: Polygon, edgeIndex: number, t: number, point: Point): { loop: Polygon; index: number } {
+  const SNAP = 1e-4;
+  if (t <= SNAP) return { loop, index: edgeIndex };
+  const nextIndex = (edgeIndex + 1) % loop.length;
+  if (t >= 1 - SNAP) return { loop, index: nextIndex };
+  const augmented = loop.slice();
+  augmented.splice(edgeIndex + 1, 0, point);
+  return { loop: augmented, index: edgeIndex + 1 };
+}
+
 // True if a and b overlap or come within `gap` of each other. Unlike polygonMinDistance, this
 // stops at the first violating segment pair instead of always scanning every pair to find the
 // exact minimum — the gap check only ever needs a yes/no answer, and with a nonzero gap most

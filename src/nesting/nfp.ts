@@ -1,5 +1,5 @@
 import type { Clipper2ZFactoryFunction, MainModule, PathD, PathsD } from 'clipper2-wasm/dist/clipper2z';
-import { Point, Polygon } from './geometry';
+import { Point, Polygon, polygonSignedArea } from './geometry';
 
 // clipper2-wasm ships dual ESM/CJS builds without a proper "exports" map pairing its "main" (CJS,
 // used by our commonjs project) with its "types" field (which points at the ESM build's .d.ts) —
@@ -82,17 +82,12 @@ export function inflate(poly: Polygon, delta: number): Polygon {
   }
 }
 
-// Returns candidate translation vectors — in the same "bbox-min-corner target" sense used
-// elsewhere in this module — for placing `movingNormalized` (a candidate part's rotated outline,
-// already translated so its own bounding-box min corner sits at (0,0)) against one obstacle
-// polygon (an already-placed part, in absolute sheet coordinates).
-//
-// Every vertex of the resulting no-fit-polygon is a position where the candidate would sit
-// exactly touching the obstacle (or `gap` away, if gap > 0) without overlapping it — a compact,
-// geometrically meaningful set of positions, in contrast to exhaustively scanning every placed
-// part's own vertices as an approximation (which scales badly and produces mostly-irrelevant
-// candidates; see packer.ts's history before this).
-export function nfpAnchors(obstacle: Polygon, movingNormalized: Polygon, gap: number): Point[] {
+// Returns the no-fit-polygon between `obstacle` and `movingNormalized` as its actual loop(s)
+// (not flattened to a point cloud) — every vertex is a position where the candidate would sit
+// exactly touching the obstacle (or `gap` away, if gap > 0) without overlapping it, and the edges
+// between vertices are themselves valid touching positions (used by the boundary-slide search in
+// packer.ts to consider more than just the discrete vertices).
+export function nfpLoops(obstacle: Polygon, movingNormalized: Polygon, gap: number): Polygon[] {
   const obstacleToUse = gap > 0 ? inflate(obstacle, gap) : obstacle;
   if (obstacleToUse.length < 3 || movingNormalized.length < 3) return [];
 
@@ -108,17 +103,73 @@ export function nfpAnchors(obstacle: Polygon, movingNormalized: Polygon, gap: nu
     // (moving + T) touches `obstacle`, i.e. T in (obstacle - moving) — so `moving` is passed
     // first, `obstacle` second.
     nfpPaths = m.MinkowskiDiffD(movingPath, obstaclePath, true, DECIMAL_PLACES);
-    const points: Point[] = [];
-    for (let i = 0; i < nfpPaths.size(); i++) {
-      for (const pt of fromPathD(nfpPaths.get(i))) points.push(pt);
-    }
-    return points;
+    const loops: Polygon[] = [];
+    for (let i = 0; i < nfpPaths.size(); i++) loops.push(fromPathD(nfpPaths.get(i)));
+
+    // MinkowskiDiffD reliably returns a second, oppositely-wound "hole" loop alongside the real
+    // outer touching-boundary loop — verified empirically (same "don't trust the naive reading"
+    // lesson as the argument order above) by checking what its vertices actually mean: for two
+    // simple 10x10/4x4 squares its bbox is exactly [0,0]-[6,6], i.e. precisely the sub-region of
+    // translations where the moving shape is fully swallowed inside the obstacle (an anchor there
+    // always overlaps, at every single point — not a touching position at all, just an inner
+    // boundary between "swallowed" and "partially overlapping"). A concave notch's own inner
+    // corner vertex (the actual touching position we care about) always lands on the genuine
+    // outer loop, not this one — confirmed on the same L-shape-notch case packer.test.ts exercises
+    // — so discarding negative-signed-area loops removes only ever-invalid noise, never a real
+    // candidate.
+    return loops.filter((loop) => polygonSignedArea(loop) > 0);
   } catch (e) {
-    if (process.env.NFP_DEBUG) console.error('nfpAnchors: MinkowskiDiffD threw', e);
+    if (process.env.NFP_DEBUG) console.error('nfpLoops: MinkowskiDiffD threw', e);
     return [];
   } finally {
     movingPath.delete();
     obstaclePath.delete();
     if (nfpPaths) nfpPaths.delete();
+  }
+}
+
+// Flattened-to-points convenience wrapper over nfpLoops, for callers that only need candidate
+// positions and don't care about which loop/edge each vertex came from.
+export function nfpAnchors(obstacle: Polygon, movingNormalized: Polygon, gap: number): Point[] {
+  const points: Point[] = [];
+  for (const loop of nfpLoops(obstacle, movingNormalized, gap)) points.push(...loop);
+  return points;
+}
+
+// Merges multiple polygon loops (e.g. several obstacles' NFPs, all computed against the same
+// moving shape) into the boundary of their combined union — i.e. the true boundary of "every
+// position where the moving shape would overlap AT LEAST ONE of them". Walking this combined
+// boundary (rather than any one obstacle's NFP in isolation) is what lets a slide search follow
+// one obstacle's edge and then naturally continue along a second obstacle's edge where it takes
+// over, instead of only snapping to each NFP's own discrete vertices.
+export function unionPolygons(loops: Polygon[]): Polygon[] {
+  const usable = loops.filter((l) => l.length >= 3);
+  if (usable.length <= 1) return usable;
+
+  const m = requireModule();
+  const paths = new m.PathsD();
+  const madePaths: PathD[] = [];
+  try {
+    for (const loop of usable) {
+      const path = m.MakePathD(toFlat(loop));
+      madePaths.push(path);
+      paths.push_back(path);
+    }
+
+    let unioned: PathsD | null = null;
+    try {
+      unioned = m.UnionSelfD(paths, m.FillRule.NonZero, DECIMAL_PLACES);
+      const result: Polygon[] = [];
+      for (let i = 0; i < unioned.size(); i++) result.push(fromPathD(unioned.get(i)));
+      return result;
+    } catch (e) {
+      if (process.env.NFP_DEBUG) console.error('unionPolygons: UnionSelfD threw', e);
+      return usable;
+    } finally {
+      if (unioned) unioned.delete();
+    }
+  } finally {
+    for (const p of madePaths) p.delete();
+    paths.delete();
   }
 }

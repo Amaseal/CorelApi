@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import {
   Polygon,
   boundingBox,
+  insertOnEdge,
   minAreaBoundingRectAngle,
+  nearestPointOnLoops,
   pointInPolygon,
   polygonArea,
   polygonMinDistance,
@@ -121,6 +123,52 @@ describe('minAreaBoundingRectAngle', () => {
     const restored = rotateAround(rect, angle, [0, 0]);
     const bb = boundingBox(restored);
     assert.ok(Math.abs(bb.width * bb.height - 100) < 1e-6);
+  });
+});
+
+describe('nearestPointOnLoops', () => {
+  it('finds the perpendicular touch point and distance to the nearest edge', () => {
+    const square: Polygon = [[0, 0], [10, 0], [10, 10], [0, 10]];
+    const located = nearestPointOnLoops([5, -3], [square]);
+    assert.ok(located);
+    assert.equal(located!.loopIndex, 0);
+    assert.equal(located!.edgeIndex, 0); // the (0,0)->(10,0) edge
+    assert.ok(Math.abs(located!.t - 0.5) < 1e-9);
+    assert.deepEqual(located!.point, [5, 0]);
+    assert.ok(Math.abs(located!.dist - 3) < 1e-9);
+  });
+
+  it('picks the closer of two loops', () => {
+    const near: Polygon = [[0, 0], [10, 0], [10, 10], [0, 10]];
+    const far: Polygon = [[100, 100], [110, 100], [110, 110], [100, 110]];
+    const located = nearestPointOnLoops([5, -1], [far, near]);
+    assert.ok(located);
+    assert.equal(located!.loopIndex, 1);
+  });
+});
+
+describe('insertOnEdge', () => {
+  const square: Polygon = [[0, 0], [10, 0], [10, 10], [0, 10]];
+
+  it('splits an edge to insert a genuinely new interior vertex', () => {
+    const { loop, index } = insertOnEdge(square, 0, 0.5, [5, 0]);
+    assert.equal(loop.length, 5);
+    assert.equal(index, 1);
+    assert.deepEqual(loop[1], [5, 0]);
+    assert.deepEqual(loop[0], [0, 0]);
+    assert.deepEqual(loop[2], [10, 0]);
+  });
+
+  it('snaps to the existing start vertex instead of inserting when t is ~0', () => {
+    const { loop, index } = insertOnEdge(square, 0, 0.00001, [0.0001, 0]);
+    assert.equal(loop.length, 4);
+    assert.equal(index, 0);
+  });
+
+  it('snaps to the existing end vertex instead of inserting when t is ~1', () => {
+    const { loop, index } = insertOnEdge(square, 0, 0.99999, [9.9999, 0]);
+    assert.equal(loop.length, 4);
+    assert.equal(index, 1);
   });
 });
 
