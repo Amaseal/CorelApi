@@ -3,10 +3,12 @@ import assert from 'node:assert/strict';
 import {
   Polygon,
   boundingBox,
+  minAreaBoundingRectAngle,
   pointInPolygon,
   polygonArea,
   polygonMinDistance,
   polygonsOverlap,
+  rotateAround,
   rotateAroundCentroid,
   simplifyToPointBudget,
 } from './geometry';
@@ -93,6 +95,32 @@ describe('rotateAroundCentroid', () => {
     const bb = boundingBox(rotated);
     assert.ok(Math.abs(bb.width - 10) < 1e-6);
     assert.ok(Math.abs(bb.height - 10) < 1e-6);
+  });
+});
+
+describe('minAreaBoundingRectAngle', () => {
+  it('finds the angle that restores a rotated rectangle to its true minimal bounding box', () => {
+    // A 20x5 rectangle rotated by an arbitrary angle has a much larger axis-aligned bbox than its
+    // true 20x5 footprint. The computed angle should un-rotate it back to (close to) that minimum.
+    const rect: Polygon = [[0, 0], [20, 0], [20, 5], [0, 5]];
+    const tilted = rotateAround(rect, 37, [0, 0]);
+
+    // The returned angle is meant to be applied directly (same convention as rotateAroundCentroid
+    // elsewhere: rotationDeg is the angle APPLIED to the original outline), not un-rotated.
+    const angle = minAreaBoundingRectAngle(tilted);
+    const restored = rotateAround(tilted, angle, [0, 0]);
+    const bb = boundingBox(restored);
+    const area = bb.width * bb.height;
+
+    assert.ok(Math.abs(area - 100) < 1e-6, `expected minimal area ~100, got ${area}`);
+  });
+
+  it('leaves an already axis-aligned rectangle at (a multiple of 90 degrees from) zero', () => {
+    const rect: Polygon = [[0, 0], [20, 0], [20, 5], [0, 5]];
+    const angle = minAreaBoundingRectAngle(rect);
+    const restored = rotateAround(rect, angle, [0, 0]);
+    const bb = boundingBox(restored);
+    assert.ok(Math.abs(bb.width * bb.height - 100) < 1e-6);
   });
 });
 

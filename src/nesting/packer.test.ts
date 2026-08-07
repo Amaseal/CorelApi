@@ -1,6 +1,7 @@
-import { describe, it } from 'node:test';
+import { before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { Polygon, polygonMinDistance } from './geometry';
+import { initClipper } from './nfp';
 import { runNesting } from './nest';
 import { packAttempt } from './packer';
 import { PartInstance } from './types';
@@ -9,6 +10,10 @@ const rect = (w: number, h: number): Polygon => [[0, 0], [w, 0], [w, h], [0, h]]
 
 const noProgress = () => {};
 const neverCancelled = () => false;
+
+before(async () => {
+  await initClipper();
+});
 
 describe('runNesting', () => {
   it('packs every instance without any overlap or gap violation', async () => {
@@ -69,8 +74,8 @@ describe('runNesting', () => {
     const L: Polygon = [[0, 0], [10, 0], [10, 5], [5, 5], [5, 10], [0, 10]];
     const square: Polygon = [[0, 0], [4, 0], [4, 4], [0, 4]];
     const instances: PartInstance[] = [
-      { instanceId: 'L#0', partId: 'L', outline: L, holes: [], rotationMode: 'locked' },
-      { instanceId: 'sq#0', partId: 'sq', outline: square, holes: [], rotationMode: 'locked' },
+      { instanceId: 'L#0', partId: 'L', outline: L, holes: [], rotationMode: 'locked', rotationDeg: 0 },
+      { instanceId: 'sq#0', partId: 'sq', outline: square, holes: [], rotationMode: 'locked', rotationDeg: 0 },
     ];
 
     const result = await packAttempt({ width: 10, height: 10 }, 0, instances);

@@ -13,6 +13,10 @@ export interface PartInstance {
   outline: Polygon;
   holes: Polygon[];
   rotationMode: RotationMode;
+  // The ONE rotation angle this instance is placed at for a given attempt — not exhaustively
+  // searched by the packer. Matches SVGnest/Deepnest: rotation is a gene the genetic algorithm
+  // evolves across many cheap attempts, not something re-tried 24 ways inside every single one.
+  rotationDeg: number;
 }
 
 export interface Placement {

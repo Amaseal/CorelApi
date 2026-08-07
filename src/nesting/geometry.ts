@@ -87,6 +87,66 @@ export function rotateAroundCentroid(poly: Polygon, angleDeg: number): Polygon {
   return rotateAround(poly, angleDeg, centroid(poly));
 }
 
+// Convex hull via monotone chain (Andrew's algorithm), O(n log n).
+export function convexHull(points: Polygon): Polygon {
+  const pts = [...points].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const n = pts.length;
+  if (n < 3) return pts;
+
+  const cross = (o: Point, a: Point, b: Point) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+
+  const lower: Point[] = [];
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+
+  const upper: Point[] = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const p = pts[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+// The rotation angle (degrees) that minimizes a polygon's own axis-aligned bounding box area —
+// a cheap, deterministic "natural orientation" for a part, with no search and no NFP computation
+// involved. Relies on a standard result: the minimum-area bounding rectangle of a convex shape
+// always has one side collinear with one of its own edges, so trying each convex-hull edge's
+// angle and keeping the best finds it in O(n) after the O(n log n) hull.
+//
+// This is the practical alternative to random/exhaustive rotation search for nesting: e-cut's own
+// "Fix angle: Auto" setting (confirmed via direct comparison against it) behaves like this — pick
+// one good angle per part cheaply, rather than spending search budget trying many.
+export function minAreaBoundingRectAngle(poly: Polygon): number {
+  const hull = convexHull(poly);
+  if (hull.length < 3) return 0;
+
+  let bestAngle = 0;
+  let bestArea = Infinity;
+
+  for (let i = 0; i < hull.length; i++) {
+    const a = hull[i];
+    const b = hull[(i + 1) % hull.length];
+    const edgeAngleDeg = Math.atan2(b[1] - a[1], b[0] - a[0]) * (180 / Math.PI);
+    const rotated = rotateAround(poly, -edgeAngleDeg, [0, 0]);
+    const bb = boundingBox(rotated);
+    const area = bb.width * bb.height;
+    if (area < bestArea) {
+      bestArea = area;
+      bestAngle = -edgeAngleDeg;
+    }
+  }
+
+  let angle = bestAngle % 360;
+  if (angle < 0) angle += 360;
+  return angle;
+}
+
 function orientation(a: Point, b: Point, c: Point): number {
   const val = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
   if (Math.abs(val) < EPS) return 0;

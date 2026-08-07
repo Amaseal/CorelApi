@@ -1,41 +1,85 @@
-import ClipperLib = require('clipper-lib');
+import type { Clipper2ZFactoryFunction, MainModule, PathD, PathsD } from 'clipper2-wasm/dist/clipper2z';
 import { Point, Polygon } from './geometry';
 
-// mm -> Clipper integer units. Clipper requires integer coordinates for numerical robustness;
-// 1000x gives micron precision, comfortably within safe integer range for mm-scale drawings.
-const CLIPPER_SCALE = 1000;
+// clipper2-wasm ships dual ESM/CJS builds without a proper "exports" map pairing its "main" (CJS,
+// used by our commonjs project) with its "types" field (which points at the ESM build's .d.ts) —
+// so a plain `import` of the value has no declaration file under our tsconfig. require() sidesteps
+// that; the type-only import above still gives real type safety for everything after this line.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const Clipper2ZFactory = require('clipper2-wasm') as Clipper2ZFactoryFunction;
 
-function toClipperPath(poly: Polygon): ClipperLib.Path {
-  return poly.map(([x, y]) => ({ X: Math.round(x * CLIPPER_SCALE), Y: Math.round(y * CLIPPER_SCALE) }));
+// Decimal places of precision Clipper2 keeps when internally converting our mm-scale doubles to
+// its integer representation. 4 gives sub-micron precision — comfortably more than needed here.
+const DECIMAL_PLACES = 4;
+
+let clipperModule: MainModule | null = null;
+
+// Must be called once, and awaited, before any nesting job runs — see index.ts's startup sequence.
+// The module is loaded once and reused for the lifetime of the process; nfp.ts's exported
+// functions stay synchronous-shaped for all their (many, deep in the beam search) call sites.
+export async function initClipper(): Promise<void> {
+  if (clipperModule) return;
+  clipperModule = await Clipper2ZFactory();
 }
 
-function fromClipperPath(path: ClipperLib.Path): Point[] {
-  return path.map((p) => [p.X / CLIPPER_SCALE, p.Y / CLIPPER_SCALE] as Point);
+function requireModule(): MainModule {
+  if (!clipperModule) {
+    throw new Error('Clipper2 WASM module not initialized — call initClipper() at server startup before nesting');
+  }
+  return clipperModule;
+}
+
+function toFlat(poly: Polygon): number[] {
+  const flat: number[] = [];
+  for (const [x, y] of poly) { flat.push(x, y); }
+  return flat;
+}
+
+function fromPathD(path: PathD): Point[] {
+  const points: Point[] = [];
+  const n = path.size();
+  for (let i = 0; i < n; i++) {
+    const p = path.get(i);
+    points.push([p.x, p.y]);
+  }
+  return points;
 }
 
 // Inflates a closed polygon outward by `delta` (mm). Used to bake a required gap directly into
 // NFP computation, so the resulting candidate positions already respect spacing without a
 // separate distance check downstream.
 //
-// NOTE: verified empirically against this clipper-lib version (6.4.2) — its @types package has
-// at least one wrong member name (EndType_ instead of EndType) that doesn't match the runtime
-// module, so this file deliberately avoids relying on anything from @types/clipper-lib beyond
-// basic shape typing, and every ClipperLib.* member used here (EndType.etClosedPolygon,
-// JoinType.jtMiter, ClipperOffset, Clipper.MinkowskiDiff) was confirmed against the actual
-// runtime export list rather than assumed from the type declarations.
+// NOTE: these WASM-backed objects (PathD, PathsD, ...) are Emscripten embind bindings over C++
+// values, not plain JS objects — they must be explicitly `.delete()`d after use or their memory
+// leaks on the WASM heap for the lifetime of the (long-running) server process. Every object
+// created in this file is deleted in a finally block, even on error.
 export function inflate(poly: Polygon, delta: number): Polygon {
   if (delta <= 0) return poly;
-  const co = new ClipperLib.ClipperOffset();
-  co.AddPath(toClipperPath(poly), ClipperLib.JoinType.jtMiter, ClipperLib.EndType.etClosedPolygon);
-  const solution: ClipperLib.Paths = [];
-  co.Execute(solution, delta * CLIPPER_SCALE);
-  if (solution.length === 0) return poly;
-  // Offsetting a concave polygon can split it into multiple pieces; keep the largest as a
-  // reasonable stand-in for "the main outline" — good enough as an NFP input, since final
-  // placement validity is always re-checked exactly by the caller regardless.
-  let largest = solution[0];
-  for (const s of solution) if (s.length > largest.length) largest = s;
-  return fromClipperPath(largest);
+  const m = requireModule();
+
+  const path = m.MakePathD(toFlat(poly));
+  const paths = new m.PathsD();
+  paths.push_back(path);
+
+  let inflated: PathsD | null = null;
+  try {
+    inflated = m.InflatePathsD(paths, delta, m.JoinType.Miter, m.EndType.Polygon, 2, DECIMAL_PLACES, 0);
+    if (inflated.size() === 0) return poly;
+    // Offsetting a concave polygon can split it into multiple pieces; keep the largest as a
+    // reasonable stand-in for "the main outline" — good enough as an NFP input, since final
+    // placement validity is always re-checked exactly by the caller regardless.
+    let largestIdx = 0;
+    let largestSize = 0;
+    for (let i = 0; i < inflated.size(); i++) {
+      const size = inflated.get(i).size();
+      if (size > largestSize) { largestSize = size; largestIdx = i; }
+    }
+    return fromPathD(inflated.get(largestIdx));
+  } finally {
+    path.delete();
+    paths.delete();
+    if (inflated) inflated.delete();
+  }
 }
 
 // Returns candidate translation vectors — in the same "bbox-min-corner target" sense used
@@ -52,23 +96,29 @@ export function nfpAnchors(obstacle: Polygon, movingNormalized: Polygon, gap: nu
   const obstacleToUse = gap > 0 ? inflate(obstacle, gap) : obstacle;
   if (obstacleToUse.length < 3 || movingNormalized.length < 3) return [];
 
-  const obstaclePath = toClipperPath(obstacleToUse);
-  const movingPath = toClipperPath(movingNormalized);
+  const m = requireModule();
+  const movingPath = m.MakePathD(toFlat(movingNormalized));
+  const obstaclePath = m.MakePathD(toFlat(obstacleToUse));
 
-  let nfpPaths: ClipperLib.Paths;
+  let nfpPaths: PathsD | null = null;
   try {
     // Argument order matters and is NOT the naive "(stationary, moving)" reading — verified
-    // empirically that ClipperLib.Clipper.MinkowskiDiff(A, B) computes B - A (as point sets), and
-    // we want translation vectors T such that (moving + T) touches `obstacle`, i.e.
-    // T in (obstacle - moving) — so `moving` is passed first, `obstacle` second.
-    nfpPaths = ClipperLib.Clipper.MinkowskiDiff(movingPath, obstaclePath);
-  } catch {
+    // empirically (same convention as Clipper1's clipper-lib) that MinkowskiDiffD(A, B, ...)
+    // computes B - A (as point sets), and we want translation vectors T such that
+    // (moving + T) touches `obstacle`, i.e. T in (obstacle - moving) — so `moving` is passed
+    // first, `obstacle` second.
+    nfpPaths = m.MinkowskiDiffD(movingPath, obstaclePath, true, DECIMAL_PLACES);
+    const points: Point[] = [];
+    for (let i = 0; i < nfpPaths.size(); i++) {
+      for (const pt of fromPathD(nfpPaths.get(i))) points.push(pt);
+    }
+    return points;
+  } catch (e) {
+    if (process.env.NFP_DEBUG) console.error('nfpAnchors: MinkowskiDiffD threw', e);
     return [];
+  } finally {
+    movingPath.delete();
+    obstaclePath.delete();
+    if (nfpPaths) nfpPaths.delete();
   }
-
-  const points: Point[] = [];
-  for (const path of nfpPaths) {
-    for (const p of path) points.push([p.X / CLIPPER_SCALE, p.Y / CLIPPER_SCALE]);
-  }
-  return points;
 }
