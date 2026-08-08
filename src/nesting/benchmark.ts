@@ -108,20 +108,25 @@ async function main() {
   }
 
   const budgetSec = Number(process.argv.find((a) => /^\d+$/.test(a))) || 90;
-  console.log(`Running nest (gap=0, free rotation, ${budgetSec}s budget)...`);
+  const immigrantsArg = process.argv.find((a) => /^--immigrants=\d+$/.test(a));
+  const randomImmigrantsPerGen = immigrantsArg ? Number(immigrantsArg.split('=')[1]) : undefined;
+  console.log(`Running nest (gap=0, free rotation, ${budgetSec}s budget${randomImmigrantsPerGen !== undefined ? `, randomImmigrantsPerGen=${randomImmigrantsPerGen}` : ''})...`);
+
+  const formatFootprints = (r: { sheetsUsed: number; sheetFootprints: { width: number; height: number }[] }) =>
+    `${r.sheetsUsed} sheet(s), footprint ${r.sheetFootprints.map((f) => `${f.width.toFixed(1)}x${f.height.toFixed(1)}`).join(', ')}`;
+
   const start = Date.now();
   const result = await runNesting(
     { width: widthMm, height: heightMm * 3 }, // generous height allowance, like a roll
     0,
     parts,
-    { timeBudgetSec: budgetSec },
-    (iterations, best) => {
-      if (best) {
-        console.log(
-          `  attempt ${iterations}, ${((Date.now() - start) / 1000).toFixed(1)}s: ` +
-          `${best.sheetsUsed} sheet(s), footprint ${best.sheetFootprints.map((f) => `${f.width.toFixed(1)}x${f.height.toFixed(1)}`).join(', ')}`
-        );
-      }
+    { timeBudgetSec: budgetSec, randomImmigrantsPerGen },
+    (iterations, current, best) => {
+      const currentInfo = current ? formatFootprints(current) : 'no fit';
+      const bestInfo = best ? formatFootprints(best) : 'no valid arrangement yet';
+      console.log(
+        `  attempt ${iterations}, ${((Date.now() - start) / 1000).toFixed(1)}s — this try: ${currentInfo} | best so far: ${bestInfo}`
+      );
     },
     () => false,
   );

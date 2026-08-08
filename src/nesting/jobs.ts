@@ -23,6 +23,10 @@ interface Job {
   elapsedMs: number;
   iterationsTried: number;
   best: PackResult | null;
+  // The most recent attempt's own result, separate from `best` — lets a caller compare "what did
+  // the last try actually get" against "what's the best so far" to confirm the search is really
+  // keeping the best one, not just reporting whatever ran most recently.
+  lastAttempt: PackResult | null;
   error: string | null;
   cancelled: boolean;
 }
@@ -44,6 +48,7 @@ export function createJob(config: NestJobConfig): string {
     elapsedMs: 0,
     iterationsTried: 0,
     best: null,
+    lastAttempt: null,
     error: null,
     cancelled: false,
   };
@@ -65,16 +70,18 @@ export function createJob(config: NestJobConfig): string {
     config.gap,
     config.parts,
     config.budget,
-    (iterationsTried, best) => {
+    (iterationsTried, current, best) => {
       job.iterationsTried = iterationsTried;
       job.best = best;
+      job.lastAttempt = current;
       job.elapsedMs = Date.now() - startedAt;
 
       const now = Date.now();
       if (now - lastProgressLogAt >= PROGRESS_LOG_INTERVAL_MS) {
         lastProgressLogAt = now;
+        const currentInfo = current ? `this try: ${current.sheetsUsed} sheet(s) (${describeFootprints(current)})` : 'this try: no fit';
         const bestInfo = best ? `best so far: ${best.sheetsUsed} sheet(s) (${describeFootprints(best)}), ${best.utilizationPct.toFixed(1)}% used` : 'no valid arrangement yet';
-        console.log(`[nest ${id}] progress: ${iterationsTried} attempt(s), ${(job.elapsedMs / 1000).toFixed(1)}s elapsed, ${bestInfo}`);
+        console.log(`[nest ${id}] progress: ${iterationsTried} attempt(s), ${(job.elapsedMs / 1000).toFixed(1)}s elapsed, ${currentInfo}, ${bestInfo}`);
       }
     },
     () => job.cancelled,

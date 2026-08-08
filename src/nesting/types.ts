@@ -47,6 +47,12 @@ export interface PackResult {
 export interface PassBudget {
   timeBudgetSec?: number;
   maxIterations?: number;
+  // Fresh random individuals injected into the GA population each generation, on top of elitism
+  // and crossover/mutation — fights premature convergence (crossover/mutation alone can only ever
+  // recombine genetic material already in the population, so once it converges toward similar
+  // individuals nothing pushes back against a local optimum). Optional so callers that don't care
+  // get the tuned default in nest.ts.
+  randomImmigrantsPerGen?: number;
 }
 
 // Thrown for nesting-domain failures (e.g. a part larger than the sheet) as opposed to bugs.

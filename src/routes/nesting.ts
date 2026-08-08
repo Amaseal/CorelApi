@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { Point, Polygon, simplifyToPointBudget } from '../nesting/geometry';
 import { cancelJob, createJob, getJob, NestJobConfig } from '../nesting/jobs';
 import { NestPart } from '../nesting/nest';
-import { RotationMode } from '../nesting/types';
+import { PackResult, RotationMode } from '../nesting/types';
 
 const router = Router();
 
@@ -50,13 +50,16 @@ function parseConfig(body: any): NestJobConfig {
   const timeBudgetSec = typeof body.timeBudgetSec === 'number' && body.timeBudgetSec > 0 ? body.timeBudgetSec : undefined;
   const maxIterations = typeof body.maxIterations === 'number' && body.maxIterations > 0 ? Math.floor(body.maxIterations) : undefined;
   if (!timeBudgetSec && !maxIterations) throw new Error('Provide either timeBudgetSec or maxIterations');
+  const randomImmigrantsPerGen = typeof body.randomImmigrantsPerGen === 'number' && body.randomImmigrantsPerGen >= 0
+    ? Math.floor(body.randomImmigrantsPerGen)
+    : undefined;
   if (!Array.isArray(body.parts) || body.parts.length === 0) throw new Error('parts must be a non-empty array');
 
   const parts = body.parts.map(parsePart);
   return {
     sheet: { width: sheet.widthMm, height: sheet.heightMm },
     gap,
-    budget: { timeBudgetSec, maxIterations },
+    budget: { timeBudgetSec, maxIterations, randomImmigrantsPerGen },
     parts,
   };
 }
@@ -72,7 +75,21 @@ router.post('/jobs', (req, res) => {
   }
 });
 
-// GET /nesting/jobs/:id — poll status/progress while a job runs.
+// Serializes a PackResult down to just what a status poll needs to assess it at a glance — actual
+// mm footprint per sheet, not just utilizationPct (which alone can't distinguish "tight but tall"
+// from "loose but short").
+function summarize(result: PackResult | null) {
+  if (!result) return null;
+  return {
+    sheetsUsed: result.sheetsUsed,
+    utilizationPct: result.utilizationPct,
+    footprints: result.sheetFootprints.map((f) => ({ width: f.width, height: f.height })),
+  };
+}
+
+// GET /nesting/jobs/:id — poll status/progress while a job runs. Reports the most recent attempt
+// (`lastAttempt`) alongside `best` so a caller can visually confirm the search is actually keeping
+// the best-scoring arrangement seen so far, not just echoing whatever ran most recently.
 router.get('/jobs/:id', (req, res) => {
   const job = getJob(req.params.id);
   if (!job) { res.status(404).json({ error: 'Not found' }); return; }
@@ -80,8 +97,8 @@ router.get('/jobs/:id', (req, res) => {
     status: job.status,
     elapsedSec: job.elapsedMs / 1000,
     iterationsTried: job.iterationsTried,
-    bestSheetsUsed: job.best ? job.best.sheetsUsed : null,
-    bestUtilizationPct: job.best ? job.best.utilizationPct : null,
+    lastAttempt: summarize(job.lastAttempt),
+    best: summarize(job.best),
     error: job.error,
   });
 });

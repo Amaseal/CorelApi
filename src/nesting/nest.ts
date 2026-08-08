@@ -120,7 +120,9 @@ const POPULATION_SIZE = 6;
 // occasional, surgical jumps rather than wholesale reshuffling.
 const ORDER_MUTATION_RATE = 0.03;
 const ROTATION_MUTATION_RATE = 0.1;
-const RANDOM_IMMIGRANTS_PER_GEN = 2;
+// Used when the caller doesn't specify budget.randomImmigrantsPerGen (see PassBudget) — exposed
+// as a tunable so it can be tried from the plugin without a code change.
+const DEFAULT_RANDOM_IMMIGRANTS_PER_GEN = 2;
 
 // Rank-based weighted selection favoring fitter individuals: `sortedPop` must already be sorted
 // best-first. Best gets weight POPULATION_SIZE, worst gets weight 1 — simpler than SVGnest's exact
@@ -201,7 +203,7 @@ export async function runNesting(
   gap: number,
   parts: NestPart[],
   budget: PassBudget,
-  onProgress: (iterationsTried: number, best: PackResult | null) => void,
+  onProgress: (iterationsTried: number, current: PackResult | null, best: PackResult | null) => void,
   isCancelled: () => boolean,
 ): Promise<PackResult> {
   const baseInstances = expandInstances(parts);
@@ -213,6 +215,7 @@ export async function runNesting(
   if (!Number.isFinite(maxIterations) && !Number.isFinite(timeBudgetMs)) {
     throw new NestingError('A time or iteration budget is required');
   }
+  const randomImmigrantsPerGen = budget.randomImmigrantsPerGen ?? DEFAULT_RANDOM_IMMIGRANTS_PER_GEN;
 
   const start = Date.now();
   const withinBudget = () => iterations < maxIterations && Date.now() - start < timeBudgetMs && !isCancelled();
@@ -263,7 +266,7 @@ export async function runNesting(
       iterations++;
       if (result && (!best || isBetter(result, best))) best = result;
       scored.push({ individual, fitness: result ? fitnessOf(result) : Number.MAX_SAFE_INTEGER });
-      onProgress(iterations, best);
+      onProgress(iterations, result, best);
 
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
@@ -280,7 +283,7 @@ export async function runNesting(
     // local optimum. This was measured to plateau for 20+ attempts with zero improvement without
     // this — the earlier (pre-GA) hill-climbing search had an equivalent "full reshuffle" escape
     // hatch; this is the GA's version of the same idea.
-    for (let i = 0; i < RANDOM_IMMIGRANTS_PER_GEN && nextGen.length < POPULATION_SIZE; i++) {
+    for (let i = 0; i < randomImmigrantsPerGen && nextGen.length < POPULATION_SIZE; i++) {
       nextGen.push(randomIndividual(baseInstances, autoAngles));
     }
     while (nextGen.length < POPULATION_SIZE) {
