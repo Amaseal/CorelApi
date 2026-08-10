@@ -16,15 +16,21 @@ function normalizeToOrigin(poly: Polygon): Polygon {
 const NFP_SEARCH_POINTS = 40;
 
 // Real cost is obstacleCount * movingPoints * obstaclePoints, not just a flat per-shape cost — so
-// on a small job (few obstacles), far more precision per shape is affordable without materially
+// on a small job (few obstacles), more precision per shape is affordable without materially
 // affecting total time. This matters concretely: a coarse 40-point proxy can round off exactly the
 // notch that would let two complex, concave parts interlock closely, so the search never even
 // considers the tight-fitting position — confirmed directly against a real job where two ~40+ node
 // contours nested with a visible gap that manual placement closed easily. Only steps down to the
 // original safety cap once there are enough obstacles that full precision would actually be slow.
+//
+// The first tier was originally 150, not 100 — measured to push a single attempt on a real job to
+// ~15s, leaving a 60s budget too few attempts for the GA to do its own (cross-attempt) job. Combined
+// with the per-part rotation search (which multiplies this same cost ~3-5x per part, see
+// candidateRotations below) the two compound multiplicatively, so this alone doesn't need to carry
+// the full precision gain — dialed back to trade some of it for attempt count instead.
 function nfpSearchPointBudget(obstacleCount: number): number {
-  if (obstacleCount <= 3) return 150;
-  if (obstacleCount <= 10) return 80;
+  if (obstacleCount <= 3) return 100;
+  if (obstacleCount <= 10) return 70;
   return NFP_SEARCH_POINTS;
 }
 
@@ -197,14 +203,22 @@ function footprintScoreAgainst(candidate: Polygon, base: BaseBBox): number {
   return width + height * 2;
 }
 
-// Sum of bounding-box distance to every already-placed part — 0 exactly when touching all of them,
-// growing with how much daylight sits between the candidate and its neighbors. Bounding-box
-// distance (not true polygon distance) since this only needs to break ties, not drive the primary
-// decision, and it's already computed cheaply elsewhere in this file.
+// Distance to the SINGLE NEAREST already-placed part — 0 exactly when touching at least one of
+// them. Deliberately the minimum, not the sum: summing distance to every placed part behaves like
+// minimizing distance to the geometric center of the whole cluster (a median-seeking pull), which
+// drags later parts toward the MIDDLE of everything already placed instead of toward whichever one
+// neighbor they could actually tuck against — confirmed as the cause of a real job visibly
+// clustering toward the sheet's center instead of hugging a corner the way e-cut's own results do.
+// Nearest-neighbor distance rewards touching without introducing any directional pull at all.
+// Bounding-box distance (not true polygon distance) since this only needs to break ties, not drive
+// the primary decision, and it's already computed cheaply elsewhere in this file.
 function tightnessScore(candidate: Polygon, placed: Polygon[]): number {
-  let sum = 0;
-  for (const p of placed) sum += boundingBoxDistance(candidate, p);
-  return sum;
+  let min = Infinity;
+  for (const p of placed) {
+    const d = boundingBoxDistance(candidate, p);
+    if (d < min) min = d;
+  }
+  return placed.length === 0 ? 0 : min;
 }
 
 // Two candidate positions can leave the EXACT SAME overall footprint — e.g. both sit entirely
@@ -232,13 +246,13 @@ interface PlacementResult {
 // underlying "how fine-grained is a rotation step" decision and should be changed together).
 const FREE_ROTATION_STEP_DEG = 15;
 // How many steps on either side of the GA-assigned seed angle to also try at placement time (e.g.
-// 2 tries seed, seed +/-15 deg, seed +/-30 deg -- 5 angles total). Deliberately a narrow LOCAL
-// search around the gene's seed, not the full 24-angle range: a full per-part search every
-// placement would multiply attempt cost by ~24x, collapsing the attempt count the GA depends on
-// for its own (evolutionary, cross-attempt) exploration. This instead multiplies cost by ~5x,
-// trading some attempt count for finding a genuinely tight fit within each one -- closer to how
-// e-cut spends its own budget (far fewer tries, each one considering more per part).
-const FREE_LOCAL_SEARCH_STEPS = 2;
+// 1 tries seed, seed +/-15 deg -- 3 angles total). Deliberately a narrow LOCAL search around the
+// gene's seed, not the full 24-angle range: a full per-part search every placement would multiply
+// attempt cost by ~24x, collapsing the attempt count the GA depends on for its own (evolutionary,
+// cross-attempt) exploration. This instead multiplies cost by ~3x — was 2 (5 angles), dialed back
+// after measuring the combination of this AND the raised NFP precision budget push a single
+// attempt on a real job to ~15s, too few attempts left in a 60s budget for the GA itself to work.
+const FREE_LOCAL_SEARCH_STEPS = 1;
 const STEP90_ANGLES = [0, 90, 180, 270];
 
 // The rotation angles actually tried when placing this part on this attempt. 'locked' has exactly
