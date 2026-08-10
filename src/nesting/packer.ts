@@ -178,21 +178,54 @@ function footprintScoreAgainst(candidate: Polygon, base: BaseBBox): number {
 
 interface PlacementResult {
   outline: Polygon;
+  rotationDeg: number;
 }
 
-// Tries to place `part` — at its already-assigned rotationDeg (see PartInstance) — onto one
-// sheet. Rotation is NOT searched here: it's a gene the caller's genetic algorithm evolves across
-// attempts (matches SVGnest/Deepnest — cheap greedy placement per attempt, quality from evolving
-// many attempts, not from exhaustively re-trying every angle inside each one).
-//
-// Among all valid candidate positions, picks whichever leaves the SMALLEST resulting overall
-// bounding box (see footprintScoreAgainst) — not simply the lowest-Y position. Pure lowest-Y was
-// measured to squeeze a small part into a leftover gap deep inside an already-placed concave
-// shape's own bounding box (technically valid, zero overlap) while leaving large, genuinely open
-// areas elsewhere on the sheet untouched, since a tight nook 8 shapes deep in can still sort as
-// "lower" than open space that happens to start slightly higher up.
-function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[], gap: number): PlacementResult | null {
-  const rotated = rotateAroundCentroid(part.outline, part.rotationDeg);
+// Granularity for 'free' mode's local rotation search below — matches nest.ts's own step size for
+// the GA's rotation gene (kept as a separate constant rather than a shared import so packer.ts and
+// nest.ts don't need to depend on each other for a single number; both represent the same
+// underlying "how fine-grained is a rotation step" decision and should be changed together).
+const FREE_ROTATION_STEP_DEG = 15;
+// How many steps on either side of the GA-assigned seed angle to also try at placement time (e.g.
+// 2 tries seed, seed +/-15 deg, seed +/-30 deg -- 5 angles total). Deliberately a narrow LOCAL
+// search around the gene's seed, not the full 24-angle range: a full per-part search every
+// placement would multiply attempt cost by ~24x, collapsing the attempt count the GA depends on
+// for its own (evolutionary, cross-attempt) exploration. This instead multiplies cost by ~5x,
+// trading some attempt count for finding a genuinely tight fit within each one -- closer to how
+// e-cut spends its own budget (far fewer tries, each one considering more per part).
+const FREE_LOCAL_SEARCH_STEPS = 2;
+const STEP90_ANGLES = [0, 90, 180, 270];
+
+// The rotation angles actually tried when placing this part on this attempt. 'locked' has exactly
+// one legal angle (an explicit user constraint -- print orientation, fabric grain -- never
+// auto-rotated away from). 'step90' has only 4 legal angles total, cheap enough to always try all
+// of them rather than trusting whichever one the GA gene happened to pick. 'free' searches a
+// handful of neighbors around the GA's seed angle (see FREE_LOCAL_SEARCH_STEPS) -- the seed still
+// comes from evolution across attempts (see nest.ts), this only refines it locally within one.
+function candidateRotations(part: PartInstance): number[] {
+  if (part.rotationMode === 'locked') return [0];
+  if (part.rotationMode === 'step90') return STEP90_ANGLES;
+
+  const seed = part.rotationDeg;
+  const angles = new Set<number>([seed]);
+  for (let k = 1; k <= FREE_LOCAL_SEARCH_STEPS; k++) {
+    angles.add(((seed + k * FREE_ROTATION_STEP_DEG) % 360 + 360) % 360);
+    angles.add(((seed - k * FREE_ROTATION_STEP_DEG) % 360 + 360) % 360);
+  }
+  return [...angles];
+}
+
+// Tries to place `part`, AT ONE GIVEN ROTATION, onto one sheet. Among all valid candidate
+// positions, picks whichever leaves the SMALLEST resulting overall bounding box (see
+// footprintScoreAgainst) — not simply the lowest-Y position. Pure lowest-Y was measured to squeeze
+// a small part into a leftover gap deep inside an already-placed concave shape's own bounding box
+// (technically valid, zero overlap) while leaving large, genuinely open areas elsewhere on the
+// sheet untouched, since a tight nook 8 shapes deep in can still sort as "lower" than open space
+// that happens to start slightly higher up.
+function tryPlaceAtRotation(
+  outline: Polygon, rotationDeg: number, sheet: SheetSize, placed: Polygon[], gap: number,
+): PlacementResult | null {
+  const rotated = rotateAroundCentroid(outline, rotationDeg);
   const normalized = normalizeToOrigin(rotated);
 
   const searchMoving = simplifyToPointBudget(normalized, NFP_SEARCH_POINTS, 0.5);
@@ -222,7 +255,25 @@ function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[]
     if (slid) { bestAnchor = slid.anchor; bestScore = slid.score; }
   }
 
-  return { outline: placeAtAnchor(rotated, bestAnchor) };
+  return { outline: placeAtAnchor(rotated, bestAnchor), rotationDeg };
+}
+
+// Tries every candidate rotation for `part` (see candidateRotations) against the same sheet, and
+// keeps whichever (rotation, position) combination scores best -- this is the local search that
+// lets a single attempt find a genuinely tight fit, rather than only ever trying whatever rotation
+// the GA's gene happened to assign for the whole attempt (see nest.ts).
+function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[], gap: number): PlacementResult | null {
+  let best: PlacementResult | null = null;
+  let bestScore = Infinity;
+
+  for (const rotationDeg of candidateRotations(part)) {
+    const result = tryPlaceAtRotation(part.outline, rotationDeg, sheet, placed, gap);
+    if (!result) continue;
+    const score = footprintScoreAgainst(result.outline, computeBaseBBox(placed));
+    if (score < bestScore) { bestScore = score; best = result; }
+  }
+
+  return best;
 }
 
 // Node is single-threaded, and this loop is the only CPU-heavy part of the whole API — a single
@@ -267,7 +318,7 @@ export async function packAttempt(sheet: SheetSize, gap: number, instances: Part
       sheetIndex = sheetsPlaced.length - 1;
       result = tryPlaceOnSheet(part, sheet, sheetsPlaced[sheetIndex], gap);
       if (!result) {
-        throw new NestingError(`Part "${part.partId}" does not fit on an empty sheet at rotation ${part.rotationDeg}`);
+        throw new NestingError(`Part "${part.partId}" does not fit on an empty sheet at any tried rotation`);
       }
     }
 
@@ -279,7 +330,7 @@ export async function packAttempt(sheet: SheetSize, gap: number, instances: Part
       sheetIndex,
       x: bb.minX,
       y: bb.minY,
-      rotationDeg: part.rotationDeg,
+      rotationDeg: result.rotationDeg,
       outline: result.outline,
     });
 
