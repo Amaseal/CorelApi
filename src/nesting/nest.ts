@@ -1,5 +1,5 @@
 import { Polygon, boundingBox, minAreaBoundingRectAngle, netArea } from './geometry';
-import { packAttempt } from './packer';
+import { runPackAttempt } from './workerPool';
 import { NestingError, PackResult, PartInstance, PassBudget, RotationMode, SheetSize } from './types';
 
 export interface NestPart {
@@ -105,13 +105,13 @@ function shuffled<T>(arr: T[]): T[] {
   return copy;
 }
 
-// Sized for the packer's per-attempt cost, which is no longer cheap: since packAttempt now runs a
-// full compaction pass after the greedy placement (see packer.ts's compactSheet), one attempt
-// costs several seconds, not ~1s. A population of 10 needs 10 evaluations just to complete a
-// single generation — measured to blow almost an entire 60s budget on ONE ungoverned population,
-// meaning crossover/selection/elitism never fired even once (confirmed by a real run where the
-// best result was byte-for-byte identical across all 9 attempts that fit in the budget). Smaller
-// so several real generations — where the GA's actual value comes from — fit in a realistic budget.
+// Sized for the packer's per-attempt cost: a single packAttempt on a real job runs several
+// seconds, not ~1s. Population evaluation now runs across a worker pool (see workerPool.ts), one
+// individual per worker, so a whole generation costs roughly max(individual times) rather than
+// their sum — but POPULATION_SIZE is still kept modest rather than scaled up to match core count,
+// since a bigger population also means fewer generations complete in a given time budget, and
+// generations (crossover/selection/elitism) are where the GA's actual value comes from, not raw
+// per-generation breadth.
 const POPULATION_SIZE = 6;
 // Order mutation now relocates a part to ANY position (see mutate() below) instead of swapping
 // with a neighbor — a much stronger move. At the old 0.1 rate that's ~1.7 of 17 parts randomly
@@ -250,14 +250,17 @@ export async function runNesting(
   for (let i = population.length; i < POPULATION_SIZE; i++) population.push(randomIndividual(baseInstances, autoAngles));
 
   while (withinBudget()) {
-    const scored: { individual: PartInstance[]; fitness: number }[] = [];
-
-    for (const individual of population) {
-      if (!withinBudget()) break;
-
+    // Every individual in the generation is dispatched to the worker pool at once (see
+    // workerPool.ts) — they're mutually independent, so this evaluates the whole generation in
+    // roughly max(individual time) rather than their sum, instead of one packAttempt after
+    // another on the main thread. Budget is only re-checked between generations now, not per
+    // individual: with parallel dispatch there's no meaningful way to bail out of a
+    // half-finished generation early, and any overrun is bounded by one generation's worth of
+    // time, which running in parallel keeps small anyway.
+    const scored = await Promise.all(population.map(async (individual) => {
       let result: PackResult | null = null;
       try {
-        result = await packAttempt(sheet, gap, individual);
+        result = await runPackAttempt(sheet, gap, individual);
       } catch (e) {
         if (!(e instanceof NestingError)) throw e;
         // This specific order/rotation combination didn't fit — a bad individual, not a fatal
@@ -266,11 +269,9 @@ export async function runNesting(
 
       iterations++;
       if (result && (!best || isBetter(result, best))) best = result;
-      scored.push({ individual, fitness: result ? fitnessOf(result) : Number.MAX_SAFE_INTEGER });
       onProgress(iterations, result, best);
-
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
+      return { individual, fitness: result ? fitnessOf(result) : Number.MAX_SAFE_INTEGER };
+    }));
 
     if (!withinBudget() || scored.length === 0) break;
 

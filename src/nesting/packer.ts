@@ -1,4 +1,4 @@
-import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
+import { BoundingBox, EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
 import { inflate, nfpLoops } from './nfp';
 import { NestingError, PackResult, PartInstance, Placement, SheetFootprint, SheetSize } from './types';
 
@@ -95,6 +95,24 @@ function candidateAnchors(sheet: SheetSize, perObstacleLoops: Polygon[][]): Poin
 // single-sheet layouts to spuriously overflow onto a second sheet, since the search never even
 // considered the wide-open space that was actually available.
 const MAX_ANCHORS = 5000;
+
+// Exact (not approximate) reject test: the no-fit-polygon between `moving` and `obstacle` is a
+// Minkowski difference, obstacle - moving (see nfp.ts's own comment on argument order), and the
+// bounding box of a Minkowski difference of two point sets is exactly
+// [bbox(obstacle).min - bbox(moving).max, bbox(obstacle).max - bbox(moving).min] componentwise —
+// a real algebraic bound, not a heuristic, so this can never reject an obstacle that could
+// actually contribute a valid anchor. Lets tryPlaceAtRotation skip the WASM Minkowski-diff call
+// entirely for obstacles whose NFP can't possibly touch the sheet at all — on a sheet with many
+// already-placed parts, most of them are nowhere near where the next part could still land, and
+// each skipped one saves a full nfpLoops() round trip (path construction, Minkowski diff, cleanup)
+// for zero loss of candidate positions.
+function nfpCouldReachSheet(obstacleBBox: BoundingBox, movingBBox: BoundingBox, sheet: SheetSize): boolean {
+  const nfpMinX = obstacleBBox.minX - movingBBox.maxX;
+  const nfpMaxX = obstacleBBox.maxX - movingBBox.minX;
+  const nfpMinY = obstacleBBox.minY - movingBBox.maxY;
+  const nfpMaxY = obstacleBBox.maxY - movingBBox.minY;
+  return nfpMaxX >= -EPS && nfpMinX <= sheet.width + EPS && nfpMaxY >= -EPS && nfpMinY <= sheet.height + EPS;
+}
 
 function fitsOnSheet(poly: Polygon, sheet: SheetSize, placed: Polygon[], gap: number): boolean {
   const bb = boundingBox(poly);
@@ -237,9 +255,19 @@ function tryPlaceAtRotation(
 
   const pointBudget = nfpSearchPointBudget(placed.length);
   const searchMoving = simplifyToPointBudget(normalized, pointBudget, 0.5);
+  const movingBBox = boundingBox(searchMoving);
+
   // gap is already baked into each searchObstacle by prepareSearchObstacle, so nfpLoops is called
   // with gap 0 here to avoid inflating it a second time.
-  const perObstacleLoops = placed.map((obstacle) => nfpLoops(prepareSearchObstacle(obstacle, gap, placed.length), searchMoving, 0));
+  let skipped = 0;
+  const perObstacleLoops: Polygon[][] = [];
+  for (const obstacle of placed) {
+    const prepared = prepareSearchObstacle(obstacle, gap, placed.length);
+    if (!nfpCouldReachSheet(boundingBox(prepared), movingBBox, sheet)) { skipped++; continue; }
+    perObstacleLoops.push(nfpLoops(prepared, searchMoving, 0));
+  }
+  if (process.env.NFP_DEBUG && skipped > 0) console.error(`tryPlaceAtRotation: skipped ${skipped}/${placed.length} obstacle(s) unreachable from the sheet`);
+
   const anchors = candidateAnchors(sheet, perObstacleLoops);
   const base = computeBaseBBox(placed);
 

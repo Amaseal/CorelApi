@@ -8,7 +8,7 @@ import libraryRouter  from './routes/library';
 import settingsRouter from './routes/settings';
 import ordersRouter   from './routes/orders';
 import nestingRouter  from './routes/nesting';
-import { initClipper } from './nesting/nfp';
+import { initWorkerPool } from './nesting/workerPool';
 
 const app = express();
 
@@ -57,8 +57,7 @@ async function start() {
   await migrate(db, { migrationsFolder: './drizzle' });
   console.log('Migrations applied.');
 
-  await initClipper();
-  console.log('Clipper2 WASM module loaded.');
+  initWorkerPool();
 
   app.listen(PORT, () => {
     console.log(`Shape API listening on :${PORT}`);
