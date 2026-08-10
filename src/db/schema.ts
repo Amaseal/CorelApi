@@ -30,7 +30,6 @@ export const sizeLibrary = pgTable('size_library', {
   id:         serial('id').primaryKey(),
   productId:  integer('product_id').notNull().references(() => products.id, { onDelete: 'cascade' }),
   sizeLabel:  text('size_label').notNull(),
-  partName:   text('part_name').notNull(),
   svgContent: text('svg_content').notNull(),
   capturedAt: timestamp('captured_at', { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [unique().on(t.productId, t.sizeLabel, t.partName)]);
+}, (t) => [unique().on(t.productId, t.sizeLabel)]);

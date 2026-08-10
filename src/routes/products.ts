@@ -65,10 +65,9 @@ router.delete('/:id/parts/:name', async (req, res) => {
   const productId = Number(req.params.id);
   const partName  = req.params.name;
   try {
-    // Cascade: remove library entries for this part first
-    await db.delete(sizeLibrary).where(
-      and(eq(sizeLibrary.productId, productId), eq(sizeLibrary.partName, partName))
-    );
+    // Design-template parts are decoupled from captured library shapes now
+    // (a size_library row holds a whole size's formation, not one part) —
+    // no cascade into sizeLibrary here.
     await db.delete(productParts).where(
       and(eq(productParts.productId, productId), eq(productParts.partName, partName))
     );
@@ -156,18 +155,16 @@ router.get('/:id/library', async (req, res) => {
       .select({
         id:         sizeLibrary.id,
         sizeLabel:  sizeLibrary.sizeLabel,
-        partName:   sizeLibrary.partName,
         capturedAt: sizeLibrary.capturedAt,
         hasSvg:     sizeLibrary.svgContent,
       })
       .from(sizeLibrary)
       .where(eq(sizeLibrary.productId, Number(req.params.id)))
-      .orderBy(asc(sizeLibrary.partName), asc(sizeLibrary.sizeLabel));
+      .orderBy(asc(sizeLibrary.sizeLabel));
 
     res.json(rows.map(r => ({
       id:         r.id,
       sizeLabel:  r.sizeLabel,
-      partName:   r.partName,
       capturedAt: r.capturedAt,
       hasSvg:     r.hasSvg.length > 0,
     })));
@@ -175,39 +172,17 @@ router.get('/:id/library', async (req, res) => {
 });
 
 router.post('/:id/library', async (req, res) => {
-  const { size, part, svg } = req.body as { size?: string; part?: string; svg?: string };
-  if (!size || !part || !svg) { res.status(400).json({ error: 'size, part, svg required' }); return; }
+  const { size, svg } = req.body as { size?: string; svg?: string };
+  if (!size || !svg) { res.status(400).json({ error: 'size, svg required' }); return; }
   try {
     await db
       .insert(sizeLibrary)
-      .values({ productId: Number(req.params.id), sizeLabel: size, partName: part, svgContent: svg })
+      .values({ productId: Number(req.params.id), sizeLabel: size, svgContent: svg })
       .onConflictDoUpdate({
-        target: [sizeLibrary.productId, sizeLibrary.sizeLabel, sizeLibrary.partName],
+        target: [sizeLibrary.productId, sizeLibrary.sizeLabel],
         set: { svgContent: sql`excluded.svg_content`, capturedAt: sql`NOW()` },
       });
     res.sendStatus(201);
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-router.get('/:id/part-shapes', async (req, res) => {
-  const part = req.query.part as string | undefined;
-  if (!part) { res.status(400).json({ error: 'part query param required' }); return; }
-  try {
-    const rows = await db
-      .select({
-        id:         sizeLibrary.id,
-        sizeLabel:  sizeLibrary.sizeLabel,
-        partName:   sizeLibrary.partName,
-        svgContent: sizeLibrary.svgContent,
-        capturedAt: sizeLibrary.capturedAt,
-      })
-      .from(sizeLibrary)
-      .where(and(
-        eq(sizeLibrary.productId, Number(req.params.id)),
-        eq(sizeLibrary.partName, part)
-      ))
-      .orderBy(asc(sizeLibrary.sizeLabel));
-    res.json(rows);
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
@@ -219,7 +194,6 @@ router.get('/:id/size-shapes', async (req, res) => {
       .select({
         id:         sizeLibrary.id,
         sizeLabel:  sizeLibrary.sizeLabel,
-        partName:   sizeLibrary.partName,
         svgContent: sizeLibrary.svgContent,
         capturedAt: sizeLibrary.capturedAt,
       })
@@ -227,8 +201,7 @@ router.get('/:id/size-shapes', async (req, res) => {
       .where(and(
         eq(sizeLibrary.productId, Number(req.params.id)),
         eq(sizeLibrary.sizeLabel, size)
-      ))
-      .orderBy(asc(sizeLibrary.partName));
+      ));
     res.json(rows);
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
@@ -245,7 +218,6 @@ router.get('/:id/library/shapes', async (req, res) => {
       .select({
         id:         sizeLibrary.id,
         sizeLabel:  sizeLibrary.sizeLabel,
-        partName:   sizeLibrary.partName,
         svgContent: sizeLibrary.svgContent,
         capturedAt: sizeLibrary.capturedAt,
       })
@@ -254,19 +226,17 @@ router.get('/:id/library/shapes', async (req, res) => {
         eq(sizeLibrary.productId, Number(req.params.id)),
         inArray(sizeLibrary.sizeLabel, sizes),
       ))
-      .orderBy(asc(sizeLibrary.partName), asc(sizeLibrary.sizeLabel));
+      .orderBy(asc(sizeLibrary.sizeLabel));
     res.json(rows);
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
 router.get('/:id/captured-sizes', async (req, res) => {
-  const part = req.query.part as string | undefined;
-  if (!part) { res.status(400).json({ error: 'part query param required' }); return; }
   try {
     const rows = await db
       .select({ sizeLabel: sizeLibrary.sizeLabel })
       .from(sizeLibrary)
-      .where(and(eq(sizeLibrary.productId, Number(req.params.id)), eq(sizeLibrary.partName, part)));
+      .where(eq(sizeLibrary.productId, Number(req.params.id)));
     res.json(rows.map(r => r.sizeLabel));
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });

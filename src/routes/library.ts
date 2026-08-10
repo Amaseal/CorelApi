@@ -16,7 +16,6 @@ router.get('/:id', async (req, res) => {
     res.json({
       id:         row.id,
       sizeLabel:  row.sizeLabel,
-      partName:   row.partName,
       svgContent: row.svgContent,
       capturedAt: row.capturedAt,
     });

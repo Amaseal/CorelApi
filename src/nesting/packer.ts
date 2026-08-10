@@ -1,5 +1,5 @@
-import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
-import { inflate, nfpLoops } from './nfp';
+import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, insertOnEdge, nearestPointOnLoops, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
+import { inflate, nfpLoops, unionPolygons } from './nfp';
 import { NestingError, PackResult, PartInstance, Placement, SheetFootprint, SheetSize } from './types';
 
 function normalizeToOrigin(poly: Polygon): Polygon {
@@ -68,6 +68,58 @@ function candidateAnchors(sheet: SheetSize, perObstacleLoops: Polygon[][]): Poin
 // single-sheet layouts to spuriously overflow onto a second sheet, since the search never even
 // considered the wide-open space that was actually available.
 const MAX_ANCHORS = 5000;
+
+// Safety cap on how many boundary vertices a single slide direction will step through — the walk
+// already stops as soon as a step fails to strictly improve the score, so this only guards against
+// a pathological cycle (e.g. floating-point noise making two adjacent points compare as endlessly
+// "equal-ish"), not a normal termination condition.
+const SLIDE_MAX_STEPS = 200;
+
+// A candidate part often lands touching one obstacle at a point where sliding it further (along
+// that obstacle's own edge, or past it onto a second obstacle's edge) would pack it tighter than
+// any single NFP vertex does on its own — e.g. resting against a straight edge partway between two
+// of that edge's endpoints, or rounding a corner from one obstacle's boundary onto a neighbor's.
+// `boundaryLoops` is the union of every obstacle's NFP (see unionPolygons) — its edges are exactly
+// the set of positions where the moving shape touches at least one obstacle without overlapping
+// any of them — so walking vertex-to-vertex along it from the best anchor found above, in
+// whichever direction keeps improving the placement score, finds these in-between resting spots
+// without needing a physics simulation.
+function slideAlongBoundary(
+  boundaryLoops: Polygon[],
+  startAnchor: Point,
+  startScore: number,
+  evaluate: (anchor: Point) => number | null,
+): { anchor: Point; score: number } | null {
+  if (boundaryLoops.length === 0) return null;
+
+  const located = nearestPointOnLoops(startAnchor, boundaryLoops);
+  // Only slide from a point that's actually (close to) on this boundary — e.g. the sheet-origin
+  // anchor generally isn't constrained by any obstacle at all, so there's nothing to slide along.
+  if (!located || located.dist > 0.05) return null;
+
+  const { loop, index: startIndex } = insertOnEdge(
+    boundaryLoops[located.loopIndex], located.edgeIndex, located.t, located.point,
+  );
+  if (loop.length < 2) return null;
+
+  let bestAnchor = startAnchor;
+  let bestScore = startScore;
+
+  for (const direction of [1, -1] as const) {
+    let idx = startIndex;
+    let currentScore = startScore;
+    for (let step = 0; step < SLIDE_MAX_STEPS; step++) {
+      idx = (idx + direction + loop.length) % loop.length;
+      if (idx === startIndex) break; // walked all the way around back to the start
+      const candidateScore = evaluate(loop[idx]);
+      if (candidateScore === null || candidateScore >= currentScore - EPS) break; // invalid, or no longer improving
+      currentScore = candidateScore;
+      if (currentScore < bestScore) { bestScore = currentScore; bestAnchor = loop[idx]; }
+    }
+  }
+
+  return bestScore < startScore - EPS ? { anchor: bestAnchor, score: bestScore } : null;
+}
 
 function fitsOnSheet(poly: Polygon, sheet: SheetSize, placed: Polygon[], gap: number): boolean {
   const bb = boundingBox(poly);
@@ -150,15 +202,25 @@ function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[]
   const anchors = candidateAnchors(sheet, perObstacleLoops);
   const base = computeBaseBBox(placed);
 
+  const evaluate = (anchor: Point): number | null => {
+    const candidate = placeAtAnchor(rotated, anchor);
+    if (!fitsOnSheet(candidate, sheet, placed, gap)) return null;
+    return footprintScoreAgainst(candidate, base);
+  };
+
   let bestAnchor: Point | null = null;
   let bestScore = Infinity;
   for (const anchor of anchors) {
-    const candidate = placeAtAnchor(rotated, anchor);
-    if (!fitsOnSheet(candidate, sheet, placed, gap)) continue;
-    const score = footprintScoreAgainst(candidate, base);
-    if (score < bestScore) { bestScore = score; bestAnchor = anchor; }
+    const score = evaluate(anchor);
+    if (score !== null && score < bestScore) { bestScore = score; bestAnchor = anchor; }
   }
   if (!bestAnchor) return null;
+
+  if (placed.length > 0) {
+    const boundaryLoops = unionPolygons(perObstacleLoops.flat());
+    const slid = slideAlongBoundary(boundaryLoops, bestAnchor, bestScore, evaluate);
+    if (slid) { bestAnchor = slid.anchor; bestScore = slid.score; }
+  }
 
   return { outline: placeAtAnchor(rotated, bestAnchor) };
 }
