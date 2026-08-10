@@ -120,9 +120,9 @@ const SLIDE_MAX_STEPS = 200;
 function slideAlongBoundary(
   boundaryLoops: Polygon[],
   startAnchor: Point,
-  startScore: number,
-  evaluate: (anchor: Point) => number | null,
-): { anchor: Point; score: number } | null {
+  startScore: PlacementScore,
+  evaluate: (anchor: Point) => PlacementScore | null,
+): { anchor: Point; score: PlacementScore } | null {
   if (boundaryLoops.length === 0) return null;
 
   const located = nearestPointOnLoops(startAnchor, boundaryLoops);
@@ -145,13 +145,13 @@ function slideAlongBoundary(
       idx = (idx + direction + loop.length) % loop.length;
       if (idx === startIndex) break; // walked all the way around back to the start
       const candidateScore = evaluate(loop[idx]);
-      if (candidateScore === null || candidateScore >= currentScore - EPS) break; // invalid, or no longer improving
+      if (candidateScore === null || !isBetterScore(candidateScore, currentScore)) break; // invalid, or no longer improving
       currentScore = candidateScore;
-      if (currentScore < bestScore) { bestScore = currentScore; bestAnchor = loop[idx]; }
+      if (isBetterScore(currentScore, bestScore)) { bestScore = currentScore; bestAnchor = loop[idx]; }
     }
   }
 
-  return bestScore < startScore - EPS ? { anchor: bestAnchor, score: bestScore } : null;
+  return isBetterScore(bestScore, startScore) ? { anchor: bestAnchor, score: bestScore } : null;
 }
 
 // Exact (not approximate) reject test: the no-fit-polygon between `moving` and `obstacle` is a
@@ -228,14 +228,11 @@ function footprintScoreAgainst(candidate: Polygon, base: BaseBBox): number {
 }
 
 // Distance to the SINGLE NEAREST already-placed part — 0 exactly when touching at least one of
-// them. Deliberately the minimum, not the sum: summing distance to every placed part behaves like
-// minimizing distance to the geometric center of the whole cluster (a median-seeking pull), which
-// drags later parts toward the MIDDLE of everything already placed instead of toward whichever one
-// neighbor they could actually tuck against — confirmed as the cause of a real job visibly
-// clustering toward the sheet's center instead of hugging a corner the way e-cut's own results do.
-// Nearest-neighbor distance rewards touching without introducing any directional pull at all.
-// Bounding-box distance (not true polygon distance) since this only needs to break ties, not drive
-// the primary decision, and it's already computed cheaply elsewhere in this file.
+// them. The LAST tie-break tier (see PlacementScore): among positions that are equally good on
+// everything above it, prefer touching an existing neighbor over floating in open space with
+// visible daylight around it. Bounding-box distance (not true polygon distance) since this only
+// needs to break the remaining ties, not drive a primary decision, and it's already computed
+// cheaply elsewhere in this file.
 function tightnessScore(candidate: Polygon, placed: Polygon[]): number {
   let min = Infinity;
   for (const p of placed) {
@@ -245,18 +242,60 @@ function tightnessScore(candidate: Polygon, placed: Polygon[]): number {
   return placed.length === 0 ? 0 : min;
 }
 
-// Two candidate positions can leave the EXACT SAME overall footprint — e.g. both sit entirely
-// within space a bigger part already claims, so neither one grows the combined bounding box any
-// further — in which case footprintScoreAgainst alone can't tell them apart, and picking whichever
-// was evaluated first (an accident of iteration order, unrelated to how tightly it actually nests)
-// can leave a part floating with visible daylight around it instead of tucked snugly against its
-// neighbor. Confirmed directly against a real job: two parts that clearly interlock manually landed
-// with a visible gap between them despite plenty of touching positions being available and scoring
-// identically on footprint alone. Folding tightness in as a tiebreaker (scaled far below footprint,
-// so it only ever matters among genuine ties, never overrides an actual footprint improvement)
-// fixes this without changing any placement that already had a real footprint reason to win.
-function placementScore(candidate: Polygon, base: BaseBBox, placed: Polygon[]): number {
-  return footprintScoreAgainst(candidate, base) * 1e6 + tightnessScore(candidate, placed);
+// Four-tier lexicographic score. Footprint growth dominates (the primary driver of a small final
+// sheet). Beneath it, distance from the sheet's BOTTOM edge (bb.minY) and LEFT edge (bb.minX) are
+// two SEPARATE tiers, bottom first — not one blended "distance to the corner" score (e.g.
+// Math.hypot(minX, minY)), which was tried and measured to leave real width on the table (results
+// sitting around ~1200mm wide on a ~1320mm sheet): a Euclidean corner pull weighs X and Y equally,
+// so it actively fights spreading into unused width even though width costs nothing here as long
+// as it fits (the roll is already "paid for" at its full width regardless of how much of it a
+// layout actually uses — only height/length consumed is the real cost, see nest.ts's isBetter).
+// Splitting bottom and left into their own strictly-ordered tiers means a lower-Y candidate ALWAYS
+// wins over a higher-Y one regardless of X, so a part is never kept off to one side just because
+// that side happens to be a hair closer to the origin in a combined metric — X only ever
+// discriminates among positions that are equally low. This is the classic bottom-left-fill
+// tie-break (sort by Y, then X), scoped to only ever break footprint ties rather than acting as
+// the primary criterion (a real earlier attempt at pure lowest-Y-first placement, with no
+// footprint term at all, squeezed parts into deep leftover nooks while leaving large open areas on
+// the sheet untouched — see tryPlaceAtRotation's own comment).
+//
+// This whole tie-break stack replaced an earlier "sum of distance to every already-placed part"
+// formulation (see git history) that pulled ties toward the CENTROID of the existing cluster
+// instead of any edge of the sheet. That was mistaken for a plain bug and swapped for pure
+// nearest-neighbor tightness (see tightnessScore), which fixed the centering but also removed any
+// directional preference at all -- neither one is what e-cut's own results actually do (hug the
+// bottom, use the full width).
+//
+// Kept as separate fields rather than folded into one scalar via multipliers (an earlier version
+// of this did `footprint * 1e6 + tightness`) — with four tiers, the multiplier gaps needed to keep
+// every tier from bleeding into the one above it start to eat into double-precision headroom on
+// top of real sheet dimensions; comparing tuples lexicographically (see isBetterScore) has no such
+// ceiling.
+interface PlacementScore {
+  footprint: number;
+  bottomDist: number;
+  leftDist: number;
+  tightness: number;
+}
+
+function placementScore(candidate: Polygon, base: BaseBBox, placed: Polygon[]): PlacementScore {
+  const bb = boundingBox(candidate);
+  return {
+    footprint: footprintScoreAgainst(candidate, base),
+    bottomDist: bb.minY,
+    leftDist: bb.minX,
+    tightness: tightnessScore(candidate, placed),
+  };
+}
+
+// True if `a` is a genuine improvement over `b` per placementScore's tier priority — "genuine"
+// meaning beyond EPS, so floating-point noise in an upstream tier can't produce a false tie that
+// lets a lower tier override a real (if tiny) improvement in a higher one.
+function isBetterScore(a: PlacementScore, b: PlacementScore): boolean {
+  if (Math.abs(a.footprint - b.footprint) > EPS) return a.footprint < b.footprint;
+  if (Math.abs(a.bottomDist - b.bottomDist) > EPS) return a.bottomDist < b.bottomDist;
+  if (Math.abs(a.leftDist - b.leftDist) > EPS) return a.leftDist < b.leftDist;
+  return a.tightness < b.tightness;
 }
 
 interface PlacementResult {
@@ -331,19 +370,19 @@ function tryPlaceAtRotation(
   const anchors = candidateAnchors(sheet, perObstacleLoops);
   const base = computeBaseBBox(placed);
 
-  const evaluate = (anchor: Point): number | null => {
+  const evaluate = (anchor: Point): PlacementScore | null => {
     const candidate = placeAtAnchor(rotated, anchor);
     if (!fitsOnSheet(candidate, sheet, placed, gap)) return null;
     return placementScore(candidate, base, placed);
   };
 
   let bestAnchor: Point | null = null;
-  let bestScore = Infinity;
+  let bestScore: PlacementScore | null = null;
   for (const anchor of anchors) {
     const score = evaluate(anchor);
-    if (score !== null && score < bestScore) { bestScore = score; bestAnchor = anchor; }
+    if (score !== null && (bestScore === null || isBetterScore(score, bestScore))) { bestScore = score; bestAnchor = anchor; }
   }
-  if (!bestAnchor) return null;
+  if (!bestAnchor || !bestScore) return null;
 
   if (placed.length > 0) {
     const boundaryLoops = unionPolygons(perObstacleLoops.flat());
@@ -360,14 +399,14 @@ function tryPlaceAtRotation(
 // the GA's gene happened to assign for the whole attempt (see nest.ts).
 function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[], gap: number): PlacementResult | null {
   let best: PlacementResult | null = null;
-  let bestScore = Infinity;
+  let bestScore: PlacementScore | null = null;
 
   const base = computeBaseBBox(placed);
   for (const rotationDeg of candidateRotations(part)) {
     const result = tryPlaceAtRotation(part.outline, rotationDeg, sheet, placed, gap);
     if (!result) continue;
     const score = placementScore(result.outline, base, placed);
-    if (score < bestScore) { bestScore = score; best = result; }
+    if (bestScore === null || isBetterScore(score, bestScore)) { bestScore = score; best = result; }
   }
 
   return best;
