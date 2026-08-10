@@ -57,13 +57,17 @@ function prepareSearchObstacle(obstacle: Polygon, gap: number, obstacleCount: nu
 }
 
 // Candidate bottom-left anchor points for placing a part against every already-placed obstacle on
-// this sheet: the sheet origin, plus every vertex of each obstacle's already-computed NFP loops
-// (see nfpLoops in nfp.ts — true no-fit-polygons via Minkowski difference). Each NFP vertex is an
-// exact touching position for the (simplified) search shapes, not an approximation — the actual
-// placement is still validated at full detail by fitsOnSheet before being accepted. Takes the
-// already-computed loops (rather than obstacles) so tryPlaceOnSheet can reuse the same Minkowski
-// results for the boundary-slide refinement below instead of recomputing them.
-function candidateAnchors(sheet: SheetSize, perObstacleLoops: Polygon[][]): Point[] {
+// this sheet: the sheet origin, every vertex of each obstacle's already-computed NFP loops (see
+// nfpLoops in nfp.ts — true no-fit-polygons via Minkowski difference), AND every vertex of the
+// UNIONED boundary across all of them (unionLoops — see tryPlaceAtRotation's own comment on why
+// this matters: a gap bounded by several obstacles at once can have its exact tightest-fit corner
+// where two different obstacles' NFPs actually CROSS, a real vertex of the unioned boundary that
+// isn't a vertex of either individual NFP). Each anchor is an exact touching position for the
+// (simplified) search shapes, not an approximation — the actual placement is still validated at
+// full detail by fitsOnSheet before being accepted. Takes the already-computed loops (rather than
+// obstacles) so tryPlaceOnSheet can reuse the same Minkowski/union results for the boundary-slide
+// refinement below instead of recomputing them.
+function candidateAnchors(sheet: SheetSize, perObstacleLoops: Polygon[][], unionLoops: Polygon[]): Point[] {
   const seen = new Set<string>();
   const anchors: Point[] = [];
 
@@ -80,6 +84,9 @@ function candidateAnchors(sheet: SheetSize, perObstacleLoops: Polygon[][]): Poin
     for (const loop of loops) {
       for (const [x, y] of loop) tryAdd(x, y);
     }
+  }
+  for (const loop of unionLoops) {
+    for (const [x, y] of loop) tryAdd(x, y);
   }
 
   if (process.env.NFP_DEBUG) console.error(`candidateAnchors: ${anchors.length} anchors from ${perObstacleLoops.length} obstacle(s)`);
@@ -367,7 +374,12 @@ function tryPlaceAtRotation(
   }
   if (process.env.NFP_DEBUG && skipped > 0) console.error(`tryPlaceAtRotation: skipped ${skipped}/${placed.length} obstacle(s) unreachable from the sheet`);
 
-  const anchors = candidateAnchors(sheet, perObstacleLoops);
+  // Computed once, up front, and reused both for anchor generation (candidateAnchors) and the
+  // boundary-slide refinement below — same call whether or not this attempt ends up sliding, so
+  // moving it earlier doesn't add any extra union computation, just lets candidateAnchors draw on
+  // it too instead of only individual obstacles' own NFP vertices.
+  const boundaryLoops = unionPolygons(perObstacleLoops.flat());
+  const anchors = candidateAnchors(sheet, perObstacleLoops, boundaryLoops);
   const base = computeBaseBBox(placed);
 
   const evaluate = (anchor: Point): PlacementScore | null => {
@@ -385,7 +397,6 @@ function tryPlaceAtRotation(
   if (!bestAnchor || !bestScore) return null;
 
   if (placed.length > 0) {
-    const boundaryLoops = unionPolygons(perObstacleLoops.flat());
     const slid = slideAlongBoundary(boundaryLoops, bestAnchor, bestScore, evaluate);
     if (slid) { bestAnchor = slid.anchor; bestScore = slid.score; }
   }
