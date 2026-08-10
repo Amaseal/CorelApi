@@ -23,14 +23,15 @@ const NFP_SEARCH_POINTS = 40;
 // contours nested with a visible gap that manual placement closed easily. Only steps down to the
 // original safety cap once there are enough obstacles that full precision would actually be slow.
 //
-// The first tier was originally 150, not 100 — measured to push a single attempt on a real job to
-// ~15s, leaving a 60s budget too few attempts for the GA to do its own (cross-attempt) job. Combined
-// with the per-part rotation search (which multiplies this same cost ~3-5x per part, see
-// candidateRotations below) the two compound multiplicatively, so this alone doesn't need to carry
-// the full precision gain — dialed back to trade some of it for attempt count instead.
+// Was dialed back to 100/70 for a while (see git history: "removed rotation") because the combined
+// cost of this AND the per-part rotation search (candidateRotations below) pushed a single attempt
+// on a real job to ~15s, leaving too few attempts in a 60s serial budget for the GA itself to work.
+// Restored to its original 150/80 now that population evaluation runs across a worker pool (see
+// workerPool.ts) instead of one attempt after another on one thread — the same headroom that
+// brought the boundary slide back (see packer.ts git history / slideAlongBoundary) affords this too.
 function nfpSearchPointBudget(obstacleCount: number): number {
-  if (obstacleCount <= 3) return 100;
-  if (obstacleCount <= 10) return 70;
+  if (obstacleCount <= 3) return 150;
+  if (obstacleCount <= 10) return 80;
   return NFP_SEARCH_POINTS;
 }
 
@@ -271,11 +272,13 @@ interface PlacementResult {
 // removing the boundary-slide refinement (see git history) freed up per-attempt budget for it.
 const FREE_ROTATION_STEP_DEG = 10;
 // How many steps on either side of the GA-assigned seed angle to also try at placement time (e.g.
-// 1 tries seed, seed +/-10 deg -- 3 angles total). Deliberately a narrow LOCAL search around the
-// gene's seed, not the full 36-angle range: a full per-part search every placement would multiply
-// attempt cost by ~36x, collapsing the attempt count the GA depends on for its own (evolutionary,
-// cross-attempt) exploration. This instead multiplies cost by ~3x.
-const FREE_LOCAL_SEARCH_STEPS = 1;
+// 2 tries seed, seed +/-10 deg, seed +/-20 deg -- 5 angles total). Deliberately a narrow LOCAL
+// search around the gene's seed, not the full 36-angle range: a full per-part search every
+// placement would multiply attempt cost by ~36x, collapsing the attempt count the GA depends on
+// for its own (evolutionary, cross-attempt) exploration. This instead multiplies cost by ~5x --
+// was dialed back to 1 (3 angles, ~3x) for a while for the same serial-budget reason as
+// nfpSearchPointBudget above; restored alongside it now that population evaluation is parallel.
+const FREE_LOCAL_SEARCH_STEPS = 2;
 const STEP90_ANGLES = [0, 90, 180, 270];
 
 // The rotation angles actually tried when placing this part on this attempt. 'locked' has exactly
