@@ -9,20 +9,41 @@ function normalizeToOrigin(poly: Polygon): Polygon {
 
 // Minkowski-diff NFP computation cost scales with both polygons' point counts — this is a lighter
 // proxy shape used ONLY for NFP search (the actual placed/output geometry is untouched — full
-// detail is still exactly validated by fitsOnSheet below).
+// detail is still exactly validated by fitsOnSheet below). 40 is a safety net against unexpectedly
+// detailed outlines on large jobs (see nfpSearchPointBudget below for why it isn't used directly
+// anymore) — kept as the floor that budget steps down to once there are enough obstacles for the
+// O(obstacles * points^2) cost to actually matter.
 const NFP_SEARCH_POINTS = 40;
+
+// Real cost is obstacleCount * movingPoints * obstaclePoints, not just a flat per-shape cost — so
+// on a small job (few obstacles), far more precision per shape is affordable without materially
+// affecting total time. This matters concretely: a coarse 40-point proxy can round off exactly the
+// notch that would let two complex, concave parts interlock closely, so the search never even
+// considers the tight-fitting position — confirmed directly against a real job where two ~40+ node
+// contours nested with a visible gap that manual placement closed easily. Only steps down to the
+// original safety cap once there are enough obstacles that full precision would actually be slow.
+function nfpSearchPointBudget(obstacleCount: number): number {
+  if (obstacleCount <= 3) return 150;
+  if (obstacleCount <= 10) return 80;
+  return NFP_SEARCH_POINTS;
+}
 
 // Simplifying AND gap-inflating an obstacle doesn't depend on the moving part's rotation, but
 // would otherwise be redone from scratch every time the same placed part is checked as an
 // obstacle again. Cached per obstacle polygon (keyed by object identity, stable across an
 // attempt's structural sharing), so each unique placed part only ever pays for simplify+inflate
-// once, no matter how many later parts check against it.
+// once, no matter how many later parts check against it. The budget used is whatever the sheet's
+// obstacle count was on this obstacle's FIRST use — an obstacle placed early (when the sheet was
+// sparser) keeps its higher-precision proxy for the rest of the attempt even after more parts
+// arrive; a minor inconsistency versus always reflecting the current count, but not a correctness
+// concern (fitsOnSheet always validates at full detail regardless), and arguably reasonable since
+// early/large parts are usually the ones where tight interlocking matters most.
 const searchObstacleCache = new WeakMap<Polygon, Polygon>();
 
-function prepareSearchObstacle(obstacle: Polygon, gap: number): Polygon {
+function prepareSearchObstacle(obstacle: Polygon, gap: number, obstacleCount: number): Polygon {
   const cached = searchObstacleCache.get(obstacle);
   if (cached) return cached;
-  const simplified = simplifyToPointBudget(obstacle, NFP_SEARCH_POINTS, 0.5);
+  const simplified = simplifyToPointBudget(obstacle, nfpSearchPointBudget(obstacleCount), 0.5);
   const prepared = gap > 0 ? inflate(simplified, gap) : simplified;
   searchObstacleCache.set(obstacle, prepared);
   return prepared;
@@ -176,6 +197,30 @@ function footprintScoreAgainst(candidate: Polygon, base: BaseBBox): number {
   return width + height * 2;
 }
 
+// Sum of bounding-box distance to every already-placed part — 0 exactly when touching all of them,
+// growing with how much daylight sits between the candidate and its neighbors. Bounding-box
+// distance (not true polygon distance) since this only needs to break ties, not drive the primary
+// decision, and it's already computed cheaply elsewhere in this file.
+function tightnessScore(candidate: Polygon, placed: Polygon[]): number {
+  let sum = 0;
+  for (const p of placed) sum += boundingBoxDistance(candidate, p);
+  return sum;
+}
+
+// Two candidate positions can leave the EXACT SAME overall footprint — e.g. both sit entirely
+// within space a bigger part already claims, so neither one grows the combined bounding box any
+// further — in which case footprintScoreAgainst alone can't tell them apart, and picking whichever
+// was evaluated first (an accident of iteration order, unrelated to how tightly it actually nests)
+// can leave a part floating with visible daylight around it instead of tucked snugly against its
+// neighbor. Confirmed directly against a real job: two parts that clearly interlock manually landed
+// with a visible gap between them despite plenty of touching positions being available and scoring
+// identically on footprint alone. Folding tightness in as a tiebreaker (scaled far below footprint,
+// so it only ever matters among genuine ties, never overrides an actual footprint improvement)
+// fixes this without changing any placement that already had a real footprint reason to win.
+function placementScore(candidate: Polygon, base: BaseBBox, placed: Polygon[]): number {
+  return footprintScoreAgainst(candidate, base) * 1e6 + tightnessScore(candidate, placed);
+}
+
 interface PlacementResult {
   outline: Polygon;
   rotationDeg: number;
@@ -228,17 +273,18 @@ function tryPlaceAtRotation(
   const rotated = rotateAroundCentroid(outline, rotationDeg);
   const normalized = normalizeToOrigin(rotated);
 
-  const searchMoving = simplifyToPointBudget(normalized, NFP_SEARCH_POINTS, 0.5);
+  const pointBudget = nfpSearchPointBudget(placed.length);
+  const searchMoving = simplifyToPointBudget(normalized, pointBudget, 0.5);
   // gap is already baked into each searchObstacle by prepareSearchObstacle, so nfpLoops is called
   // with gap 0 here to avoid inflating it a second time.
-  const perObstacleLoops = placed.map((obstacle) => nfpLoops(prepareSearchObstacle(obstacle, gap), searchMoving, 0));
+  const perObstacleLoops = placed.map((obstacle) => nfpLoops(prepareSearchObstacle(obstacle, gap, placed.length), searchMoving, 0));
   const anchors = candidateAnchors(sheet, perObstacleLoops);
   const base = computeBaseBBox(placed);
 
   const evaluate = (anchor: Point): number | null => {
     const candidate = placeAtAnchor(rotated, anchor);
     if (!fitsOnSheet(candidate, sheet, placed, gap)) return null;
-    return footprintScoreAgainst(candidate, base);
+    return placementScore(candidate, base, placed);
   };
 
   let bestAnchor: Point | null = null;
@@ -266,10 +312,11 @@ function tryPlaceOnSheet(part: PartInstance, sheet: SheetSize, placed: Polygon[]
   let best: PlacementResult | null = null;
   let bestScore = Infinity;
 
+  const base = computeBaseBBox(placed);
   for (const rotationDeg of candidateRotations(part)) {
     const result = tryPlaceAtRotation(part.outline, rotationDeg, sheet, placed, gap);
     if (!result) continue;
-    const score = footprintScoreAgainst(result.outline, computeBaseBBox(placed));
+    const score = placementScore(result.outline, base, placed);
     if (score < bestScore) { bestScore = score; best = result; }
   }
 
