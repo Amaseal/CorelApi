@@ -1,5 +1,5 @@
-import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, insertOnEdge, nearestPointOnLoops, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
-import { inflate, nfpLoops, unionPolygons } from './nfp';
+import { EPS, Point, Polygon, boundingBox, boundingBoxDistance, netArea, placeAtAnchor, polygonsOverlap, polygonsWithinDistance, rotateAroundCentroid, simplifyToPointBudget, translate } from './geometry';
+import { inflate, nfpLoops } from './nfp';
 import { NestingError, PackResult, PartInstance, Placement, SheetFootprint, SheetSize } from './types';
 
 function normalizeToOrigin(poly: Polygon): Polygon {
@@ -95,58 +95,6 @@ function candidateAnchors(sheet: SheetSize, perObstacleLoops: Polygon[][]): Poin
 // single-sheet layouts to spuriously overflow onto a second sheet, since the search never even
 // considered the wide-open space that was actually available.
 const MAX_ANCHORS = 5000;
-
-// Safety cap on how many boundary vertices a single slide direction will step through — the walk
-// already stops as soon as a step fails to strictly improve the score, so this only guards against
-// a pathological cycle (e.g. floating-point noise making two adjacent points compare as endlessly
-// "equal-ish"), not a normal termination condition.
-const SLIDE_MAX_STEPS = 200;
-
-// A candidate part often lands touching one obstacle at a point where sliding it further (along
-// that obstacle's own edge, or past it onto a second obstacle's edge) would pack it tighter than
-// any single NFP vertex does on its own — e.g. resting against a straight edge partway between two
-// of that edge's endpoints, or rounding a corner from one obstacle's boundary onto a neighbor's.
-// `boundaryLoops` is the union of every obstacle's NFP (see unionPolygons) — its edges are exactly
-// the set of positions where the moving shape touches at least one obstacle without overlapping
-// any of them — so walking vertex-to-vertex along it from the best anchor found above, in
-// whichever direction keeps improving the placement score, finds these in-between resting spots
-// without needing a physics simulation.
-function slideAlongBoundary(
-  boundaryLoops: Polygon[],
-  startAnchor: Point,
-  startScore: number,
-  evaluate: (anchor: Point) => number | null,
-): { anchor: Point; score: number } | null {
-  if (boundaryLoops.length === 0) return null;
-
-  const located = nearestPointOnLoops(startAnchor, boundaryLoops);
-  // Only slide from a point that's actually (close to) on this boundary — e.g. the sheet-origin
-  // anchor generally isn't constrained by any obstacle at all, so there's nothing to slide along.
-  if (!located || located.dist > 0.05) return null;
-
-  const { loop, index: startIndex } = insertOnEdge(
-    boundaryLoops[located.loopIndex], located.edgeIndex, located.t, located.point,
-  );
-  if (loop.length < 2) return null;
-
-  let bestAnchor = startAnchor;
-  let bestScore = startScore;
-
-  for (const direction of [1, -1] as const) {
-    let idx = startIndex;
-    let currentScore = startScore;
-    for (let step = 0; step < SLIDE_MAX_STEPS; step++) {
-      idx = (idx + direction + loop.length) % loop.length;
-      if (idx === startIndex) break; // walked all the way around back to the start
-      const candidateScore = evaluate(loop[idx]);
-      if (candidateScore === null || candidateScore >= currentScore - EPS) break; // invalid, or no longer improving
-      currentScore = candidateScore;
-      if (currentScore < bestScore) { bestScore = currentScore; bestAnchor = loop[idx]; }
-    }
-  }
-
-  return bestScore < startScore - EPS ? { anchor: bestAnchor, score: bestScore } : null;
-}
 
 function fitsOnSheet(poly: Polygon, sheet: SheetSize, placed: Polygon[], gap: number): boolean {
   const bb = boundingBox(poly);
@@ -244,14 +192,14 @@ interface PlacementResult {
 // the GA's rotation gene (kept as a separate constant rather than a shared import so packer.ts and
 // nest.ts don't need to depend on each other for a single number; both represent the same
 // underlying "how fine-grained is a rotation step" decision and should be changed together).
-const FREE_ROTATION_STEP_DEG = 15;
+// Was 15 (24 total legal angles) -- narrowed to 10 (36 total) for finer-grained rotation, now that
+// removing the boundary-slide refinement (see git history) freed up per-attempt budget for it.
+const FREE_ROTATION_STEP_DEG = 10;
 // How many steps on either side of the GA-assigned seed angle to also try at placement time (e.g.
-// 1 tries seed, seed +/-15 deg -- 3 angles total). Deliberately a narrow LOCAL search around the
-// gene's seed, not the full 24-angle range: a full per-part search every placement would multiply
-// attempt cost by ~24x, collapsing the attempt count the GA depends on for its own (evolutionary,
-// cross-attempt) exploration. This instead multiplies cost by ~3x — was 2 (5 angles), dialed back
-// after measuring the combination of this AND the raised NFP precision budget push a single
-// attempt on a real job to ~15s, too few attempts left in a 60s budget for the GA itself to work.
+// 1 tries seed, seed +/-10 deg -- 3 angles total). Deliberately a narrow LOCAL search around the
+// gene's seed, not the full 36-angle range: a full per-part search every placement would multiply
+// attempt cost by ~36x, collapsing the attempt count the GA depends on for its own (evolutionary,
+// cross-attempt) exploration. This instead multiplies cost by ~3x.
 const FREE_LOCAL_SEARCH_STEPS = 1;
 const STEP90_ANGLES = [0, 90, 180, 270];
 
@@ -308,12 +256,6 @@ function tryPlaceAtRotation(
     if (score !== null && score < bestScore) { bestScore = score; bestAnchor = anchor; }
   }
   if (!bestAnchor) return null;
-
-  if (placed.length > 0) {
-    const boundaryLoops = unionPolygons(perObstacleLoops.flat());
-    const slid = slideAlongBoundary(boundaryLoops, bestAnchor, bestScore, evaluate);
-    if (slid) { bestAnchor = slid.anchor; bestScore = slid.score; }
-  }
 
   return { outline: placeAtAnchor(rotated, bestAnchor), rotationDeg };
 }

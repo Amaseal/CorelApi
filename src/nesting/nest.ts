@@ -10,10 +10,11 @@ export interface NestPart {
   quantity: number;
 }
 
-// Every 15 degrees for 'free' — matches the resolution the plugin exposes; mutation can still
-// only ever land on one of these, same as before, just chosen once per part per attempt instead
-// of every angle being exhaustively tried inside every attempt.
-const FREE_ROTATION_STEP_DEG = 15;
+// Every 10 degrees for 'free' -- must match packer.ts's own FREE_ROTATION_STEP_DEG (kept as
+// separate constants rather than a shared import, see that file's comment for why). This is the
+// step the GA's rotation gene mutates by; packer.ts's own local search then tries a couple of
+// neighbors around whatever angle lands here at each part's actual placement.
+const FREE_ROTATION_STEP_DEG = 10;
 
 // One angle per part, computed once (cheap: convex hull + O(n) calipers, no NFP, no search) —
 // the rotation that minimizes the part's OWN bounding box. Confirmed against a live comparison:
