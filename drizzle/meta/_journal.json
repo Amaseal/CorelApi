@@ -29,6 +29,13 @@
       "when": 1786357241836,
       "tag": "0003_exotic_mephistopheles",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1786357241837,
+      "tag": "0004_size_base",
+      "breakpoints": true
     }
   ]
 }

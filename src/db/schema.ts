@@ -19,6 +19,7 @@ export const productSizes = pgTable('product_sizes', {
   productId: integer('product_id').notNull().references(() => products.id, { onDelete: 'cascade' }),
   sizeLabel: text('size_label').notNull(),
   sortOrder: integer('sort_order').notNull().default(0),
+  isBase:    boolean('is_base').notNull().default(false),
 }, (t) => [unique().on(t.productId, t.sizeLabel)]);
 
 export const appSettings = pgTable('app_settings', {

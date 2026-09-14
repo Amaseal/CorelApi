@@ -121,6 +121,17 @@ router.get('/:id/sizes', async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
 
+router.get('/:id/sizes-with-base', async (req, res) => {
+  try {
+    const rows = await db
+      .select({ sizeLabel: productSizes.sizeLabel, isBase: productSizes.isBase })
+      .from(productSizes)
+      .where(eq(productSizes.productId, Number(req.params.id)))
+      .orderBy(asc(productSizes.sortOrder), asc(productSizes.sizeLabel));
+    res.json(rows.map(r => ({ label: r.sizeLabel, isBase: r.isBase })));
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
 router.post('/:id/sizes', async (req, res) => {
   const { label } = req.body as { label?: string };
   if (!label?.trim()) { res.status(400).json({ error: 'label required' }); return; }
@@ -143,6 +154,24 @@ router.delete('/:id/sizes/:label', async (req, res) => {
     await db.delete(productSizes).where(
       and(eq(productSizes.productId, productId), eq(productSizes.sizeLabel, label))
     );
+    res.sendStatus(204);
+  } catch (e) { res.status(500).json({ error: String(e) }); }
+});
+
+router.patch('/:id/sizes/:label/base', async (req, res) => {
+  const productId = Number(req.params.id);
+  const label     = req.params.label;
+  const { isBase } = req.body as { isBase?: boolean };
+  if (typeof isBase !== 'boolean') { res.status(400).json({ error: 'isBase (boolean) required' }); return; }
+
+  try {
+    if (isBase) {
+      await db.update(productSizes).set({ isBase: false }).where(eq(productSizes.productId, productId));
+    }
+    await db
+      .update(productSizes)
+      .set({ isBase })
+      .where(and(eq(productSizes.productId, productId), eq(productSizes.sizeLabel, label)));
     res.sendStatus(204);
   } catch (e) { res.status(500).json({ error: String(e) }); }
 });
