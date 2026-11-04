@@ -1,4 +1,5 @@
 import { afterEach, mock, test } from 'node:test';
+import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import express from 'express';
@@ -6,6 +7,8 @@ import { db } from '../db';
 import { requireApiKey } from '../middleware/auth';
 import settingsRouter from '../routes/settings';
 import ordersRouter from '../routes/orders';
+import reportsRouter from '../routes/reports';
+import { parseInspection, validateInspection } from './inspection';
 import { generateOrders, listGeminiModels, parseOrderRows, requireModelId, testGeminiModel } from './gemini';
 
 const realFetch = globalThis.fetch;
@@ -101,12 +104,12 @@ async function withApi(initial: Record<string, string>, action: (request: (path:
   })) as never);
   process.env.API_KEY = 'local-test-auth';
   const app = express(); app.use(express.json()); app.use(requireApiKey);
-  app.use('/settings', settingsRouter); app.use('/orders', ordersRouter);
+  app.use('/settings', settingsRouter); app.use('/orders', ordersRouter); app.use('/reports', reportsRouter);
   const server = app.listen(0, '127.0.0.1'); await once(server, 'listening');
   const address = server.address() as { port: number };
   try {
     await action((path, body, authorized = true) => realFetch(`http://127.0.0.1:${address.port}${path}`, {
-      method: body === undefined ? 'GET' : path === '/orders/parse' ? 'POST' : 'PUT',
+      method: body === undefined ? 'GET' : path === '/orders/parse' || path === '/reports/inspect' ? 'POST' : 'PUT',
       headers: { 'Content-Type': 'application/json', ...(authorized ? { 'X-Api-Key': 'local-test-auth' } : {}) },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }), values);
@@ -167,5 +170,72 @@ test('model save detects a key changed during the paid test', async () => {
     });
     assert.equal((await request('/settings/ai/model', { modelId: 'gemini-future-flash' })).status, 409);
     assert.equal(values.get('ai_model'), 'gemini-old'); assert.equal(values.get('ai_model_validated'), '');
+  });
+});
+
+const png = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAXklEQVR4nO3PMQ0AMAzAsPInvYLYYVWKESTzjhsd8KsBrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BbQHKU9LC7/CP1AAAAABJRU5ErkJggg==';
+const reviewImage = (id = 'actual', kind = 'actual') => ({ id, kind, data: png, sha256: createHash('sha256').update(Buffer.from(png, 'base64')).digest('hex'), rotation: 180 });
+const inspection = () => ({ modelId: 'gemini-future-flash', inspectionKey: 'part-1', product: 'Jersey', artwork: 'home', size: 'XS', part: 'front', rowIndex: 1,
+  expected: { name: 'Jānis Āboliņš', number: '007', size: 'XS' }, images: [reviewImage(), reviewImage('detail-1', 'detail'), reviewImage('reference', 'reference')] });
+const visualResult = () => ({ coverage: 'One XS front; compare the cut-off sponsor to optional base. Small lettering uncertain.', findings: [{
+  category: 'damaged_or_clipped', imageId: 'actual', observed: 'Logo touches the clipping edge', explanation: 'Possible cut-off sponsor; operator should check, not print approval.', confidence: 'medium',
+}] });
+
+test('inspection validates PNG identities, bytes, hashes, dimensions and precise row values before Google', () => {
+  const input = validateInspection(inspection());
+  assert.equal(input.expected.number, '007'); assert.equal(input.expected.name, 'Jānis Āboliņš');
+  for (const images of [[], [reviewImage('ref', 'reference')], [reviewImage(), reviewImage()],
+    [{ ...reviewImage(), sha256: 'bad' }], [{ ...reviewImage(), rotation: Infinity }], [{ ...reviewImage(), data: 'not png' }],
+    [{ ...reviewImage(), kind: 'cdr' }], Array.from({ length: 7 }, (_, i) => reviewImage('i-' + i))])
+    assert.throws(() => validateInspection({ ...inspection(), images }));
+  const bounded = Buffer.alloc(3 * 1024 * 1024); Buffer.from(png, 'base64').copy(bounded);
+  const boundedImage = { ...reviewImage(), data: bounded.toString('base64'), sha256: createHash('sha256').update(bounded).digest('hex') };
+  assert.equal(validateInspection({ ...inspection(), images: [boundedImage] }).images.length, 1); // Large base64 must not overflow the regex stack.
+  const large = Buffer.from(png, 'base64'); large.writeUInt32BE(100000, 16);
+  assert.throws(() => validateInspection({ ...inspection(), images: [{ ...reviewImage(), data: large.toString('base64'), sha256: createHash('sha256').update(large).digest('hex') }] }));
+  assert.throws(() => validateInspection({ ...inspection(), rowIndex: 1.5 }));
+  assert.throws(() => validateInspection({ ...inspection(), expected: { name: 'x', number: 7, size: 'XS' } }));
+});
+
+test('inspection rejects malformed/truncated findings, invented evidence and unsupported claims rather than claiming a pass', () => {
+  const input = validateInspection(inspection());
+  assert.equal(parseInspection(JSON.stringify(visualResult()), input).findings[0].category, 'damaged_or_clipped');
+  for (const result of [{}, { coverage: '', findings: [] }, { coverage: 'test', findings: [null] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], imageId: 'other-run' }] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], imageId: 'reference' }] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], category: 'approved' }] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], confidence: 100 }] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], observed: '' }] }])
+    assert.throws(() => parseInspection(JSON.stringify(result), input));
+  assert.throws(() => parseInspection('{bad', input));
+  assert.deepEqual(parseInspection(JSON.stringify({ coverage: 'No obvious issue; small details uncertain. Not approval.', findings: [] }), input).findings, []);
+});
+
+test('authenticated inspection uses the snapshotted model and bounded images, with no order-parser crossover or secret leaks', async () => {
+  let calls = 0, response: unknown = generated(visualResult());
+  mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    calls++;
+    assert.ok(String(url).includes('models/gemini-future-flash:generateContent'));
+    const body = JSON.parse(init?.body as string), parts = body.contents[0].parts;
+    assert.equal(body.generationConfig.responseSchema.properties.findings.type, 'ARRAY');
+    assert.equal(parts.filter((p: { inlineData?: unknown }) => p.inlineData).length, 3);
+    assert.ok(parts[0].text.includes('UNTRUSTED DATA'));
+    assert.ok(parts[0].text.includes('007')); assert.ok(parts[0].text.includes('Jānis Āboliņš'));
+    assert.ok(parts[0].text.includes('NOT certified')); assert.ok(parts[0].text.includes('Crop edges are artificial'));
+    return json(response);
+  });
+  await withApi({ ai_provider: 'gemini', ai_key: 'secret', ai_model: 'gemini-future-flash', ai_model_validated: 'gemini-future-flash' }, async (request, values) => {
+    assert.equal((await request('/reports/inspect', inspection(), false)).status, 401); assert.equal(calls, 0);
+    assert.equal((await request('/reports/inspect', { ...inspection(), images: [] })).status, 400); assert.equal(calls, 0);
+    assert.equal((await request('/reports/inspect', { ...inspection(), modelId: 'gemini-other' })).status, 409); assert.equal(calls, 0);
+    const ok = await request('/reports/inspect', inspection()); assert.equal(ok.status, 200);
+    const result = await ok.json() as ReturnType<typeof parseInspection>; assert.equal(result.inspectionKey, 'part-1'); assert.equal(result.modelId, 'gemini-future-flash');
+    assert.equal(result.promptVersion, 'size-parts-v1'); assert.equal(result.findings[0].imageId, 'actual'); assert.equal(calls, 1);
+    response = { candidates: [{ finishReason: 'MAX_TOKENS' }] };
+    assert.equal((await request('/reports/inspect', inspection())).status, 502);
+    response = generated({ ...visualResult(), findings: [{ ...visualResult().findings[0], imageId: 'invented' }] });
+    assert.equal((await request('/reports/inspect', inspection())).status, 502);
+    values.set('ai_provider', 'openai');
+    assert.equal((await request('/reports/inspect', inspection())).status, 503); assert.equal(calls, 3);
   });
 });

@@ -97,18 +97,23 @@ export async function generateOrders(key: string, model: string, prompt: string,
   requireModelId(model);
   const parts: unknown[] = [{ text: prompt }];
   if (imageBase64) parts.push({ inlineData: { mimeType: mime, data: imageBase64 } });
-  const data = object(await request(`models/${model}:generateContent`, key, AbortSignal.timeout(60000), {
+  return parseOrderRows(await generateStructured(key, model, parts, ORDER_SCHEMA, 'order'));
+}
+
+export async function generateStructured(key: string, model: string, parts: unknown[], schema: unknown, context: string, timeout = 60000): Promise<string> {
+  requireModelId(model);
+  const data = object(await request(`models/${model}:generateContent`, key, AbortSignal.timeout(timeout), {
     contents: [{ role: 'user', parts }],
-    generationConfig: { responseMimeType: 'application/json', responseSchema: ORDER_SCHEMA, maxOutputTokens: 8192 },
+    generationConfig: { responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: 8192 },
   }));
   const candidates = data.candidates;
-  if (!Array.isArray(candidates) || candidates.length === 0) throw new AiError(502, 'Gemini returned no order content (possibly blocked).');
+  if (!Array.isArray(candidates) || candidates.length === 0) throw new AiError(502, `Gemini returned no ${context} content (possibly blocked).`);
   const candidate = object(candidates[0]);
-  if (candidate.finishReason !== 'STOP') throw new AiError(502, 'Gemini did not complete the order response. No rows were imported.');
+  if (candidate.finishReason !== 'STOP') throw new AiError(502, `Gemini did not complete the ${context} response. No result was accepted.`);
   const content = object(candidate.content);
   if (!Array.isArray(content.parts)) throw new AiError(502, 'Gemini returned no text content.');
   const text = content.parts.map(object).filter(p => p.thought !== true && typeof p.text === 'string').map(p => p.text).join('');
-  return parseOrderRows(text);
+  return text;
 }
 
 export async function testGeminiModel(key: string, model: string): Promise<void> {
