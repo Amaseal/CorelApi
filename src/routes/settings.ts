@@ -1,9 +1,10 @@
 import { Router } from 'express';
-import { eq } from 'drizzle-orm';
 import { db } from '../db';
 import { appSettings } from '../db/schema';
+import aiSettingsRouter from './aiSettings';
 
 const router = Router();
+router.use('/ai', aiSettingsRouter);
 
 // GET /settings — returns [{key, hasValue, value?}]
 // value is included for non-sensitive keys (ai_provider, ai_model); omitted for ai_key
@@ -20,6 +21,9 @@ router.get('/', async (_req, res) => {
 
 // PUT /settings/:key — upsert a setting value
 router.put('/:key', async (req, res) => {
+  if (req.params.key.startsWith('ai_')) {
+    res.status(400).json({ error: 'Use the Gemini Settings key/model actions. Legacy provider settings are no longer writable.' }); return;
+  }
   const { value } = req.body as { value?: string };
   if (typeof value !== 'string') { res.status(400).json({ error: 'value (string) required' }); return; }
   try {
