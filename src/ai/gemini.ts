@@ -97,14 +97,15 @@ export async function generateOrders(key: string, model: string, prompt: string,
   requireModelId(model);
   const parts: unknown[] = [{ text: prompt }];
   if (imageBase64) parts.push({ inlineData: { mimeType: mime, data: imageBase64 } });
-  return parseOrderRows(await generateStructured(key, model, parts, ORDER_SCHEMA, 'order'));
+  return parseOrderRows((await generateStructured(key, model, parts, ORDER_SCHEMA, 'order')).text);
 }
 
-export async function generateStructured(key: string, model: string, parts: unknown[], schema: unknown, context: string, timeout = 60000): Promise<string> {
+export async function generateStructured(key: string, model: string, parts: unknown[], schema: unknown, context: string, timeout = 60000, maxOutputTokens = 8192) {
   requireModelId(model);
+  const started = performance.now();
   const data = object(await request(`models/${model}:generateContent`, key, AbortSignal.timeout(timeout), {
     contents: [{ role: 'user', parts }],
-    generationConfig: { responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: 8192 },
+    generationConfig: { responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens },
   }));
   const candidates = data.candidates;
   if (!Array.isArray(candidates) || candidates.length === 0) throw new AiError(502, `Gemini returned no ${context} content (possibly blocked).`);
@@ -113,7 +114,12 @@ export async function generateStructured(key: string, model: string, parts: unkn
   const content = object(candidate.content);
   if (!Array.isArray(content.parts)) throw new AiError(502, 'Gemini returned no text content.');
   const text = content.parts.map(object).filter(p => p.thought !== true && typeof p.text === 'string').map(p => p.text).join('');
-  return text;
+  const usage = data.usageMetadata && typeof data.usageMetadata === 'object' && !Array.isArray(data.usageMetadata)
+    ? data.usageMetadata as Record<string, unknown> : {};
+  const tokens = (field: string): number | null => typeof usage[field] === 'number' && Number.isSafeInteger(usage[field]) && (usage[field] as number) >= 0 ? usage[field] as number : null;
+  return { text, googleMs: Math.round(performance.now() - started), usage: {
+    inputTokens: tokens('promptTokenCount'), outputTokens: tokens('candidatesTokenCount'), thinkingTokens: tokens('thoughtsTokenCount'),
+  } };
 }
 
 export async function testGeminiModel(key: string, model: string): Promise<void> {

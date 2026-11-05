@@ -2,7 +2,23 @@
 
 Implemented alongside Print Tools **1.17.0**. The client is staged to `C:\PrintToolsNative` with its version and file hashes verified. API build/tests pass; **server deployment is not verified** and no live Google requests or charges were made during development.
 
-## Prepared-size visual review (Print Tools 1.19.0)
+## Compact size review (Print Tools 1.20.0)
+
+API build and all 41 tests pass. Plugin 1.20.0 is staged to `C:\PrintToolsNative` with Corel closed; staged version, all 13 managed publish files, native host and dependencies/licenses were verified. Deploy this API revision after pushing; server deployment is not verified. The operator confirms the previous 1.19 flow works end-to-end. This revision requires coordinated client/API rollout; no dependency/schema migration. No paid model benchmark or model change has been performed.
+
+`POST /reports/inspect` now requires `{modelId, inspectionKey, promptVersion:"size-overview-v2", parts:[{id,label,hasReference}], images:[{id,kind,data,sha256}]}`. There are 1–16 unique labelled parts and one actual overview plus at most one optional reference overview. Image IDs/kinds are `actual|reference`; reference availability must match part metadata. SHA-256/base64/PNG-header limits remain enforced: 6 MiB/image, 12 MiB total decoded bytes, 1–4096 pixels/axis. Legacy requests get **409 before any Google generation call**, not a paid response an old client cannot parse. Old servers do not accept the new schema; deploy both sides before review.
+
+Google receives the overviews, part-ID/label/reference-availability mapping and a focused server-owned prompt. It does **not** receive separate model/run/product/player-expectation metadata or image hashes in its prompt; images themselves can still contain player names/design data. Model/key/inspection identity stays in authenticated transport/provenance checks. One request covers a whole size's representative, not each part. No automatic crops, paid second pass, model fallback or queue concurrency.
+
+Only two defects: **internal artwork rotated incorrectly** or **a main logo/design clipped by the garment boundary**. Ignore intentional bottom production/size labels even when clipped, personalization differences, bleed and ordinary size/proportion changes. Do not ignore an actual main logo just because it is near the bottom. No spelling/aesthetic/font/color critique or sponsor-count inventory. Image text/labels are untrusted data. Base context is optional and not certified truth; insufficient evidence means unverified. These are prompt instructions, not proof the model will obey them on real images.
+
+Response envelope: `{inspectionKey,modelId,promptVersion,status,reason,findings:[{partId,issue,note}],googleMs,usage:{inputTokens,outputTokens,thinkingTokens}}`. Status is `no_flags|issues|unverified`; issue is `rotated|clipped`. Notes/reasons max 160 characters, max 12 findings, known input part IDs only. `no_flags` requires no findings and empty reason; `issues` requires findings and empty reason; `unverified` requires a reason and may retain known findings. Invalid/blocked/truncated responses are unavailable, never a pass. Review output budget is 2048 tokens; order parsing keeps 8192. Thinking-model truncation remains a possible failure, not a reason to silently switch models or invent a pass.
+
+Google round-trip milliseconds and provider-reported input/output/thinking counts are exposed for comparison. Missing/malformed/negative usage fields become **null/unknown**, not zero. No raw model response, images/player data or keys are logged. No cost estimate without verified pricing for the exact model/tier; provider billing is authoritative, and failed calls may still be charged without usable result metadata. Client adds capture, preparation, API round-trip and preview metrics. Round-trip time is not isolated inference time.
+
+`npm run build && npm test`: all **41 tests** pass with Google/DB mocks, covering schema version rejection before charging, one/two-overview limits, part IDs/reference mapping, PNG/hash checks, focused prompt/label exclusions, compact status consistency, token budget separation, known/unknown usage and blocked/truncated results. Real model speed, quality, label suppression, small-logo readability and the operator's five-size cost comparison still require explicit paid acceptance. Choose available candidates through existing Settings discovery; no fixed latest-model list or hidden configuration change.
+
+## Prepared-size visual review (Print Tools 1.19.0 — historical)
 
 New authenticated **POST `/reports/inspect`**, separate from order parsing. Build and all 41 tests pass. Client 1.19.0 is staged to `C:\PrintToolsNative` with Corel closed; staged version, all 13 managed files, native host and dependencies/licenses were verified. Deploy this API revision after pushing; deployment of the new route is not verified. The operator confirmed the earlier 1.17 Gemini API is published; this does not deploy the new review route. No new dependencies or database migration.
 
@@ -43,7 +59,7 @@ All endpoints retain the existing `X-Api-Key` authentication. The Gemini key is 
 | PUT | `/settings/ai/key` | `{key}`; verify discovery access, then atomically save Gemini key/provider and clear model validation |
 | PUT | `/settings/ai/model` | `{modelId}`; **billable compatibility test**, then save model/validation atomically |
 | POST | `/orders/parse` | Use the saved, tested Gemini model; text/image order parsing |
-| POST | `/reports/inspect` | New in 1.19.0; explicitly authorized advisory garment-part image review, deployment pending |
+| POST | `/reports/inspect` | Explicitly authorized compact whole-size review; requires `size-overview-v2` / Print Tools 1.20.0; rollout pending |
 
 Legacy `PUT /settings/ai_*` writes are rejected so older clients cannot bypass key/model validation. Existing non-Gemini credentials are **not** sent to Google or relabelled as Gemini; the operator must explicitly save a Gemini key. Switching from another provider clears its old model. Rotating a Gemini key preserves the selected model ID but requires a fresh Test & save. Existing Gemini selections also require testing once because older configurations have no validation marker. A failed test leaves the previous model unchanged; a key changed during testing prevents saving a validation against the wrong key.
 

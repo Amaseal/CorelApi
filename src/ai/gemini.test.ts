@@ -8,7 +8,7 @@ import { requireApiKey } from '../middleware/auth';
 import settingsRouter from '../routes/settings';
 import ordersRouter from '../routes/orders';
 import reportsRouter from '../routes/reports';
-import { parseInspection, validateInspection } from './inspection';
+import { inspectSize, parseInspection, validateInspection } from './inspection';
 import { generateOrders, listGeminiModels, parseOrderRows, requireModelId, testGeminiModel } from './gemini';
 
 const realFetch = globalThis.fetch;
@@ -63,6 +63,7 @@ test('selected-model test requires discovery, image acceptance and complete stri
       generations++;
       const body = JSON.parse(init?.body as string);
       assert.equal(body.generationConfig.responseMimeType, 'application/json');
+      assert.equal(body.generationConfig.maxOutputTokens, 8192);
       assert.equal(body.generationConfig.responseSchema.items.properties.number.type, 'STRING');
       assert.equal(body.contents[0].parts[1].inlineData.mimeType, 'image/png');
       const bytes = Buffer.from(body.contents[0].parts[1].inlineData.data, 'base64');
@@ -174,68 +175,84 @@ test('model save detects a key changed during the paid test', async () => {
 });
 
 const png = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAXklEQVR4nO3PMQ0AMAzAsPInvYLYYVWKESTzjhsd8KsBrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BrQGtAa0BbQHKU9LC7/CP1AAAAABJRU5ErkJggg==';
-const reviewImage = (id = 'actual', kind = 'actual') => ({ id, kind, data: png, sha256: createHash('sha256').update(Buffer.from(png, 'base64')).digest('hex'), rotation: 180 });
-const inspection = () => ({ modelId: 'gemini-future-flash', inspectionKey: 'part-1', product: 'Jersey', artwork: 'home', size: 'XS', part: 'front', rowIndex: 1,
-  expected: { name: 'Jānis Āboliņš', number: '007', size: 'XS' }, images: [reviewImage(), reviewImage('detail-1', 'detail'), reviewImage('reference', 'reference')] });
-const visualResult = () => ({ coverage: 'One XS front; compare the cut-off sponsor to optional base. Small lettering uncertain.', findings: [{
-  category: 'damaged_or_clipped', imageId: 'actual', observed: 'Logo touches the clipping edge', explanation: 'Possible cut-off sponsor; operator should check, not print approval.', confidence: 'medium',
-}] });
+const reviewImage = (id = 'actual', kind = id) => ({ id, kind, data: png, sha256: createHash('sha256').update(Buffer.from(png, 'base64')).digest('hex') });
+const inspection = () => ({ modelId: 'gemini-future-flash', inspectionKey: 'size-1', promptVersion: 'size-overview-v2',
+  parts: [{ id: 'p1', label: 'front', hasReference: true }, { id: 'p2', label: 'back', hasReference: false }],
+  images: [reviewImage(), reviewImage('reference')] });
+const visualResult = () => ({ status: 'issues', reason: '', findings: [{ partId: 'p1', issue: 'clipped', note: 'Logo cut off at right edge.' }] });
 
-test('inspection validates PNG identities, bytes, hashes, dimensions and precise row values before Google', () => {
+test('inspection validates version, overview/part identities, PNG bytes, hashes and dimensions before Google', () => {
   const input = validateInspection(inspection());
-  assert.equal(input.expected.number, '007'); assert.equal(input.expected.name, 'Jānis Āboliņš');
+  assert.equal(input.parts.length, 2); assert.equal(input.images.length, 2);
+  assert.throws(() => validateInspection({ ...inspection(), promptVersion: 'size-parts-v1' }), /Update Print Tools/);
   for (const images of [[], [reviewImage('ref', 'reference')], [reviewImage(), reviewImage()],
-    [{ ...reviewImage(), sha256: 'bad' }], [{ ...reviewImage(), rotation: Infinity }], [{ ...reviewImage(), data: 'not png' }],
+    [{ ...reviewImage(), sha256: 'bad' }], [reviewImage('detail-1', 'detail')], [{ ...reviewImage(), data: 'not png' }],
     [{ ...reviewImage(), kind: 'cdr' }], Array.from({ length: 7 }, (_, i) => reviewImage('i-' + i))])
     assert.throws(() => validateInspection({ ...inspection(), images }));
   const bounded = Buffer.alloc(3 * 1024 * 1024); Buffer.from(png, 'base64').copy(bounded);
   const boundedImage = { ...reviewImage(), data: bounded.toString('base64'), sha256: createHash('sha256').update(bounded).digest('hex') };
-  assert.equal(validateInspection({ ...inspection(), images: [boundedImage] }).images.length, 1); // Large base64 must not overflow the regex stack.
+  assert.equal(validateInspection({ ...inspection(), parts: [{ id: 'p1', label: 'front', hasReference: false }], images: [boundedImage] }).images.length, 1); // Large base64 must not overflow the regex stack.
   const large = Buffer.from(png, 'base64'); large.writeUInt32BE(100000, 16);
   assert.throws(() => validateInspection({ ...inspection(), images: [{ ...reviewImage(), data: large.toString('base64'), sha256: createHash('sha256').update(large).digest('hex') }] }));
-  assert.throws(() => validateInspection({ ...inspection(), rowIndex: 1.5 }));
-  assert.throws(() => validateInspection({ ...inspection(), expected: { name: 'x', number: 7, size: 'XS' } }));
+  for (const parts of [[], [{ id: 'bad', label: 'front', hasReference: true }], [inspection().parts[0], inspection().parts[0]],
+    [{ id: 'p1', label: 'front', hasReference: 'yes' }], Array.from({ length: 17 }, (_, i) => ({ id: 'p' + (i + 1), label: 'part', hasReference: false }))])
+    assert.throws(() => validateInspection({ ...inspection(), parts }));
+  assert.throws(() => validateInspection({ ...inspection(), images: [reviewImage()] }), /reference availability/);
 });
 
 test('inspection rejects malformed/truncated findings, invented evidence and unsupported claims rather than claiming a pass', () => {
   const input = validateInspection(inspection());
-  assert.equal(parseInspection(JSON.stringify(visualResult()), input).findings[0].category, 'damaged_or_clipped');
-  for (const result of [{}, { coverage: '', findings: [] }, { coverage: 'test', findings: [null] },
-    { ...visualResult(), findings: [{ ...visualResult().findings[0], imageId: 'other-run' }] },
-    { ...visualResult(), findings: [{ ...visualResult().findings[0], imageId: 'reference' }] },
-    { ...visualResult(), findings: [{ ...visualResult().findings[0], category: 'approved' }] },
-    { ...visualResult(), findings: [{ ...visualResult().findings[0], confidence: 100 }] },
-    { ...visualResult(), findings: [{ ...visualResult().findings[0], observed: '' }] }])
+  assert.equal(parseInspection(JSON.stringify(visualResult()), input).findings[0].issue, 'clipped');
+  for (const result of [{}, { status: 'issues', reason: '', findings: [] }, { ...visualResult(), findings: [null] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], partId: 'other-run' }] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], issue: 'approved' }] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], note: '' }] },
+    { ...visualResult(), findings: [{ ...visualResult().findings[0], note: 'x'.repeat(161) }] },
+    { ...visualResult(), status: 'no_flags' }, { status: 'unverified', reason: '', findings: [] },
+    { status: 'no_flags', reason: 'uncertain', findings: [] },
+    { ...visualResult(), findings: Array(13).fill(visualResult().findings[0]) }])
     assert.throws(() => parseInspection(JSON.stringify(result), input));
   assert.throws(() => parseInspection('{bad', input));
-  assert.deepEqual(parseInspection(JSON.stringify({ coverage: 'No obvious issue; small details uncertain. Not approval.', findings: [] }), input).findings, []);
+  assert.deepEqual(parseInspection(JSON.stringify({ status: 'no_flags', reason: '', findings: [] }), input).findings, []);
+  assert.equal(parseInspection(JSON.stringify({ status: 'unverified', reason: 'Small logo unreadable.', findings: [] }), input).status, 'unverified');
 });
 
 test('authenticated inspection uses the snapshotted model and bounded images, with no order-parser crossover or secret leaks', async () => {
-  let calls = 0, response: unknown = generated(visualResult());
+  let calls = 0, response: unknown = { ...generated(visualResult()), usageMetadata: { promptTokenCount: 640, candidatesTokenCount: 35, thoughtsTokenCount: 120 } };
   mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
     calls++;
     assert.ok(String(url).includes('models/gemini-future-flash:generateContent'));
     const body = JSON.parse(init?.body as string), parts = body.contents[0].parts;
     assert.equal(body.generationConfig.responseSchema.properties.findings.type, 'ARRAY');
-    assert.equal(parts.filter((p: { inlineData?: unknown }) => p.inlineData).length, 3);
+    assert.equal(parts.filter((p: { inlineData?: unknown }) => p.inlineData).length, 2);
+    assert.equal(body.generationConfig.maxOutputTokens, 2048);
     assert.ok(parts[0].text.includes('UNTRUSTED DATA'));
-    assert.ok(parts[0].text.includes('007')); assert.ok(parts[0].text.includes('Jānis Āboliņš'));
-    assert.ok(parts[0].text.includes('NOT certified')); assert.ok(parts[0].text.includes('Crop edges are artificial'));
+    assert.ok(parts[0].text.includes('Small size/production labels'));
+    assert.ok(parts[0].text.includes('Ignore them even if rotated, overlapping, or clipped'));
+    assert.ok(parts[0].text.includes('Do not confuse genuine main logos near the bottom'));
+    assert.ok(parts[0].text.includes('optional context, not guaranteed ground truth'));
+    assert.ok(!JSON.stringify(parts).includes(inspection().images[0].sha256));
+    assert.ok(!parts[0].text.includes(inspection().modelId)); assert.ok(!parts[0].text.includes('size-1'));
     return json(response);
   });
   await withApi({ ai_provider: 'gemini', ai_key: 'secret', ai_model: 'gemini-future-flash', ai_model_validated: 'gemini-future-flash' }, async (request, values) => {
     assert.equal((await request('/reports/inspect', inspection(), false)).status, 401); assert.equal(calls, 0);
+    assert.equal((await request('/reports/inspect', { ...inspection(), promptVersion: 'size-parts-v1' })).status, 409); assert.equal(calls, 0);
     assert.equal((await request('/reports/inspect', { ...inspection(), images: [] })).status, 400); assert.equal(calls, 0);
     assert.equal((await request('/reports/inspect', { ...inspection(), modelId: 'gemini-other' })).status, 409); assert.equal(calls, 0);
     const ok = await request('/reports/inspect', inspection()); assert.equal(ok.status, 200);
-    const result = await ok.json() as ReturnType<typeof parseInspection>; assert.equal(result.inspectionKey, 'part-1'); assert.equal(result.modelId, 'gemini-future-flash');
-    assert.equal(result.promptVersion, 'size-parts-v1'); assert.equal(result.findings[0].imageId, 'actual'); assert.equal(calls, 1);
+    const result = await ok.json() as Awaited<ReturnType<typeof inspectSize>>; assert.equal(result.inspectionKey, 'size-1'); assert.equal(result.modelId, 'gemini-future-flash');
+    assert.equal(result.promptVersion, 'size-overview-v2'); assert.equal(result.findings[0].partId, 'p1'); assert.equal(calls, 1);
+    assert.ok(result.googleMs >= 0); assert.deepEqual(result.usage, { inputTokens: 640, outputTokens: 35, thinkingTokens: 120 });
     response = { candidates: [{ finishReason: 'MAX_TOKENS' }] };
     assert.equal((await request('/reports/inspect', inspection())).status, 502);
-    response = generated({ ...visualResult(), findings: [{ ...visualResult().findings[0], imageId: 'invented' }] });
+    response = generated({ ...visualResult(), findings: [{ ...visualResult().findings[0], partId: 'invented' }] });
     assert.equal((await request('/reports/inspect', inspection())).status, 502);
+    response = generated({ status: 'unverified', reason: 'Small bottom logo unreadable.', findings: [] });
+    const uncertain = await request('/reports/inspect', inspection()); assert.equal(uncertain.status, 200);
+    const unknown = await uncertain.json() as Awaited<ReturnType<typeof inspectSize>>;
+    assert.equal(unknown.status, 'unverified'); assert.deepEqual(unknown.usage, { inputTokens: null, outputTokens: null, thinkingTokens: null });
     values.set('ai_provider', 'openai');
-    assert.equal((await request('/reports/inspect', inspection())).status, 503); assert.equal(calls, 3);
+    assert.equal((await request('/reports/inspect', inspection())).status, 503); assert.equal(calls, 4);
   });
 });
